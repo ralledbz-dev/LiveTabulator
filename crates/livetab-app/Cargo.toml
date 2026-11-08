@@ -12,11 +12,13 @@ cuda = ["llama-cpp-4/cuda"]
 
 [dependencies]
 livetab-core = { path = "../livetab-core" }
-slint = { version = "=1.18.1", features = ["backend-winit"] }
+slint = { version = "=1.18.1", features = ["backend-winit", "image-default-formats"] }
+cpal = "=0.15.3"
 
 [target.'cfg(windows)'.dependencies]
 rfd = { version = "=0.16.0", default-features = false }
 llama-cpp-4 = { version = "=0.11.0", default-features = false, features = ["openmp", "native", "dynamic-link"] }
+wasapi = "=0.26.0"
 
 [target.'cfg(not(windows))'.dependencies]
 llama-cpp-4 = { version = "=0.11.0", default-features = false }

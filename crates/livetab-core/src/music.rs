@@ -74,25 +74,44 @@ pub fn estimate_chord(chroma: &[f32; 12]) -> Option<ChordEstimate> {
 /// Eingaben: `chroma` – zwölf Tonklassen-Amplituden.
 /// Ausgabe: Beste `KeyEstimate` oder `None` bei praktisch vollständiger Stille.
 pub fn estimate_key(chroma: &[f32; 12]) -> Option<KeyEstimate> {
+    estimate_key_candidates(chroma, 1).into_iter().next()
+}
+
+/// Zweck: Liefert die am besten passenden Dur-/Moll-Tonarten in reproduzierbarer Rangfolge.
+/// Eingaben: Zwölf Chroma-Amplituden und gewünschte Höchstzahl; negative/nichtendliche Werte werden neutralisiert.
+/// Ausgabe: Höchstens `maximum` Tonartkandidaten mit Pearson-Konfidenz, bei Stille eine leere Liste.
+pub fn estimate_key_candidates(chroma: &[f32; 12], maximum: usize) -> Vec<KeyEstimate> {
     let normalized = chroma.map(non_negative);
-    if normalized.iter().sum::<f32>() <= SILENCE_EPSILON {
-        return None;
+    if maximum == 0 || normalized.iter().sum::<f32>() <= SILENCE_EPSILON {
+        return Vec::new();
     }
-    let mut best: Option<(usize, KeyMode, f32)> = None;
+    let mut ranked = Vec::with_capacity(24);
     for tonic in 0..12 {
         let major = rotated_profile_correlation(&normalized, &MAJOR_PROFILE, tonic);
         let minor = rotated_profile_correlation(&normalized, &MINOR_PROFILE, tonic);
-        for (mode, score) in [(KeyMode::Major, major), (KeyMode::Minor, minor)] {
-            if best.map(|(_, _, current)| score > current).unwrap_or(true) {
-                best = Some((tonic, mode, score));
-            }
-        }
+        ranked.push((tonic, KeyMode::Major, major));
+        ranked.push((tonic, KeyMode::Minor, minor));
     }
-    best.map(|(tonic, mode, confidence)| KeyEstimate {
-        tonic: PITCH_NAMES[tonic],
-        mode,
-        confidence,
-    })
+    ranked.sort_by(|left, right| {
+        right
+            .2
+            .total_cmp(&left.2)
+            .then_with(|| left.0.cmp(&right.0))
+            .then_with(|| match (left.1, right.1) {
+                (KeyMode::Major, KeyMode::Minor) => std::cmp::Ordering::Less,
+                (KeyMode::Minor, KeyMode::Major) => std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
+            })
+    });
+    ranked
+        .into_iter()
+        .take(maximum.min(24))
+        .map(|(tonic, mode, confidence)| KeyEstimate {
+            tonic: PITCH_NAMES[tonic],
+            mode,
+            confidence,
+        })
+        .collect()
 }
 
 /// Zweck: Berechnet Akkord- und Tonartschätzung gemeinsam für einen Analyse-Frame.
@@ -176,6 +195,24 @@ mod tests {
         assert_eq!((key.tonic, key.mode), ("C", KeyMode::Major));
         assert!(estimate_chord(&[0.0; 12]).is_none());
         assert!(estimate_key(&[0.0; 12]).is_none());
+    }
+
+    /// Zweck: Prüft geordnete Alternativtonarten, begrenzte Kandidatenzahl und leere Stilleergebnisse.
+    /// Eingaben: Stabiles C-Dur-Chroma, maximale Anzahl zwei und ein Nullvektor.
+    /// Ausgabe: Keine; Assertions sichern besten Treffer, nicht steigende Konfidenzen und Stillebehandlung.
+    #[test]
+    fn returns_ranked_key_alternatives() {
+        let c_major_scale = [
+            1.0, 0.05, 0.7, 0.05, 0.9, 0.6, 0.05, 0.8, 0.05, 0.65, 0.05, 0.5,
+        ];
+        let candidates = estimate_key_candidates(&c_major_scale, 2);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            (candidates[0].tonic, candidates[0].mode),
+            ("C", KeyMode::Major)
+        );
+        assert!(candidates[0].confidence >= candidates[1].confidence);
+        assert!(estimate_key_candidates(&[0.0; 12], 3).is_empty());
     }
 
     /// Zweck: Prüft, dass NaN im Chroma die endlichen Akkordanteile nicht unbrauchbar macht.

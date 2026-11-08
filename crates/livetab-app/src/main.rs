@@ -1,6 +1,10 @@
+mod app_workflows;
+mod audio_capture;
 mod llama_runtime;
+mod playback_output;
 
 use crate::llama_runtime::LoadedModel;
+use livetab_core::AppController;
 use livetab_core::model_registry::{ModelRegistry, RegistrySnapshot};
 use livetab_core::project::{ProjectRecord, ProjectStore};
 #[cfg(windows)]
@@ -19,6 +23,7 @@ enum RuntimeCommand {
 type RuntimeSender = mpsc::Sender<RuntimeCommand>;
 type RuntimeState = Arc<Mutex<Option<RuntimeSender>>>;
 type ModelPathState = Arc<Mutex<Option<PathBuf>>>;
+type ModelCatalog = Arc<Mutex<Option<RegistrySnapshot>>>;
 
 /// Zweck: Startet das Slint-Fenster, verbindet UI-Callbacks mit Scan und Runtime und führt die Ereignisschleife aus.
 /// Eingaben: Keine Argumente; verwendet den ausführbaren App-Pfad sowie verbundene Modellpfad-Umgebungswerte.
@@ -29,21 +34,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_models_dir = app_models_directory();
     let current_model: ModelPathState = Arc::new(Mutex::new(None));
     let runtime_state: RuntimeState = Arc::new(Mutex::new(None));
+    let model_catalog: ModelCatalog = Arc::new(Mutex::new(None));
 
     {
         let weak = ui.as_weak();
         let app_models_dir = app_models_dir.clone();
         let current_model = Arc::clone(&current_model);
         let runtime_state = Arc::clone(&runtime_state);
+        let model_catalog = Arc::clone(&model_catalog);
         // Zweck: Verarbeitet den Klick auf „Modelle scannen“.
         // Eingaben: Keine expliziten Argumente; verwendet die gespeicherten UI-/Scan-Zustände.
         // Ausgabe: Kein Rückgabewert; startet den Scan einschließlich externer Wurzeln im Hintergrund.
-        ui.on_scan_requested(move || {
+        ui.on_scan_models_requested(move || {
             start_scan(
                 weak.clone(),
                 app_models_dir.clone(),
                 Arc::clone(&current_model),
                 Arc::clone(&runtime_state),
+                Arc::clone(&model_catalog),
                 true,
             );
         });
@@ -64,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             if let Some(handle) = weak.upgrade() {
                 handle.set_busy(true);
-                handle.set_runtime_status_text(
+                handle.set_model_status_text(
                     "llama.cpp lädt das lokale Modell im Hintergrund …".into(),
                 );
             }
@@ -86,15 +94,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .ok()
                 .and_then(|state| state.as_ref().cloned());
             let Some(sender) = sender else {
-                handle.set_runtime_status_text("Runtime ist noch nicht geladen.".into());
+                handle.set_model_status_text("Runtime ist noch nicht geladen.".into());
                 return;
             };
             handle.set_busy(true);
-            handle.set_output_text("Lokale Inferenz läuft …".into());
+            handle.set_assistant_output_text("Lokale Inferenz läuft …".into());
             if sender.send(RuntimeCommand::Generate(prompt)).is_err() {
                 handle.set_busy(false);
                 handle.set_runtime_loaded(false);
-                handle.set_runtime_status_text(
+                handle.set_model_status_text(
                     "Runtime-Worker wurde beendet; lade das Modell erneut.".into(),
                 );
             }
@@ -118,7 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Ausgabe: Kein Rückgabewert; übergibt den Pfad an den gemeinsamen Importworker.
         ui.on_import_bandmap_requested(move || {
             let Some(handle) = weak.upgrade() else { return };
-            let archive_path = PathBuf::from(handle.get_bandmap_path_text().to_string());
+            let archive_path = PathBuf::from(handle.get_project_path_text().to_string());
             if archive_path.as_os_str().is_empty() {
                 handle.set_project_status_text(
                     "Bitte zuerst den Pfad zu einer .bandmap-Datei eintragen.".into(),
@@ -129,15 +137,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    let controller = AppController::new("Unbenannt", "");
+    let lifecycle = app_workflows::wire(&ui, controller, Arc::clone(&model_catalog));
     start_restore_last_project(ui.as_weak());
     start_scan(
         ui.as_weak(),
         app_models_dir,
         Arc::clone(&current_model),
         Arc::clone(&runtime_state),
-        false,
+        Arc::clone(&model_catalog),
+        true,
     );
     ui.run()?;
+    lifecycle.stop();
     Ok(())
 }
 
@@ -186,7 +198,7 @@ fn start_bandmap_import(weak: Weak<MainWindow>, archive_path: PathBuf) {
     if handle.get_project_busy() {
         return;
     }
-    handle.set_bandmap_path_text(archive_path.to_string_lossy().into_owned().into());
+    handle.set_project_path_text(archive_path.to_string_lossy().into_owned().into());
     handle.set_project_busy(true);
     handle.set_project_status_text(
         "Dateiendung und BANDMAP-Archiv werden geprüft; das Projekt wird lokal gespeichert …"
@@ -297,13 +309,14 @@ fn start_scan(
     app_models_dir: PathBuf,
     current_model: ModelPathState,
     runtime_state: RuntimeState,
+    model_catalog: ModelCatalog,
     include_external: bool,
 ) {
     if let Some(handle) = weak.upgrade() {
         handle.set_scanning(true);
         handle.set_runtime_loaded(false);
         handle.set_model_found(false);
-        handle.set_runtime_status_text("Runtime wird nach Auswahl eines Modells geladen.".into());
+        handle.set_model_status_text("Runtime wird nach Auswahl eines Modells geladen.".into());
         handle.set_status_text(
             "App-Modellordner wird sofort geprüft; externe Modellwurzeln folgen im Hintergrund …"
                 .into(),
@@ -322,6 +335,9 @@ fn start_scan(
     thread::spawn(move || {
         let roots = ModelRegistry::default_roots(&app_models_dir);
         let quick_snapshot = ModelRegistry::scan(std::iter::once(app_models_dir.clone()));
+        if let Ok(mut catalog) = model_catalog.lock() {
+            *catalog = Some(quick_snapshot.clone());
+        }
         let quick_model = quick_snapshot
             .assistant_model()
             .map(|entry| entry.path.clone());
@@ -377,6 +393,9 @@ fn start_scan(
                 });
             });
         let snapshot = merge_snapshots(quick_snapshot, external_snapshot);
+        if let Ok(mut catalog) = model_catalog.lock() {
+            *catalog = Some(snapshot.clone());
+        }
         let selected_model = snapshot.assistant_model().map(|entry| entry.path.clone());
         if let Ok(mut path) = current_model.lock() {
             *path = selected_model;
@@ -497,7 +516,7 @@ fn start_runtime_worker(model_path: PathBuf, weak: Weak<MainWindow>, runtime_sta
                 let _ = weak.upgrade_in_event_loop(move |handle| {
                     handle.set_busy(false);
                     handle.set_runtime_loaded(false);
-                    handle.set_runtime_status_text(format!("Runtime-Fehler: {error}").into());
+                    handle.set_model_status_text(format!("Runtime-Fehler: {error}").into());
                 });
                 return;
             }
@@ -519,8 +538,10 @@ fn start_runtime_worker(model_path: PathBuf, weak: Weak<MainWindow>, runtime_sta
         let _ = weak.upgrade_in_event_loop(move |handle| {
             handle.set_busy(false);
             handle.set_runtime_loaded(true);
-            handle.set_runtime_status_text(status_for_ui.into());
-            handle.set_output_text("Runtime bereit. Prompt kann lokal ausgeführt werden.".into());
+            handle.set_model_status_text(status_for_ui.into());
+            handle.set_assistant_output_text(
+                "Runtime bereit. Prompt kann lokal ausgeführt werden.".into(),
+            );
         });
 
         while let Ok(command) = receiver.recv() {
@@ -545,8 +566,8 @@ fn start_runtime_worker(model_path: PathBuf, weak: Weak<MainWindow>, runtime_sta
                         }
                     };
                     let _ = weak.upgrade_in_event_loop(move |handle| {
-                        handle.set_output_text(output.into());
-                        handle.set_runtime_status_text(status.into());
+                        handle.set_assistant_output_text(output.into());
+                        handle.set_model_status_text(status.into());
                         handle.set_busy(false);
                     });
                 }
@@ -623,6 +644,6 @@ mod tests {
 /// Ausgabe: Keine Rückgabe; setzt bei gültigem Handle die UI-Statusanzeige.
 fn set_runtime_status(weak: &Weak<MainWindow>, status: &str) {
     if let Some(handle) = weak.upgrade() {
-        handle.set_runtime_status_text(status.into());
+        handle.set_model_status_text(status.into());
     }
 }

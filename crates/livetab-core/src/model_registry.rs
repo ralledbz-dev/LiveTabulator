@@ -45,7 +45,7 @@ pub enum ModelRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelStatus {
-    /// GGUF magic, supported header version, metadata and architecture were parsed.
+    /// GGUF-Header/Architektur oder ein unterstütztes lokales Modellbundle wurden strukturell geprüft.
     Validated,
     /// The file extension/path is relevant, but its format/runtime has not been validated.
     DetectedUnverified,
@@ -278,6 +278,16 @@ impl ModelRegistry {
                 let path = entry.path();
                 let candidate = is_model_candidate(path);
                 let file_type = entry.file_type();
+                if file_type.is_dir() {
+                    if let Some(model) = inspect_faster_whisper_directory(path, &root, root_order) {
+                        let key = normalized_path_key(&model.path);
+                        if seen.insert(key) {
+                            report.model_files_found += 1;
+                            entries.push(model);
+                        }
+                    }
+                    continue;
+                }
                 if !file_type.is_file()
                     && !(candidate
                         && file_type.is_symlink()
@@ -386,6 +396,49 @@ fn is_model_candidate(path: &Path) -> bool {
         "dll" => path.to_string_lossy().to_ascii_lowercase().contains("vamp"),
         _ => false,
     }
+}
+
+/// Zweck: Prüft die minimale CTranslate2-/faster-whisper-Verzeichnisstruktur für lokale Worttranskription.
+/// Eingaben: Verzeichnis, Suchwurzel und deren Reihenfolge aus der Modellregistry.
+/// Ausgabe: Validierter ASR-Verzeichniseintrag oder `None`; Runtime-Verfügbarkeit wird nicht vorgetäuscht.
+fn inspect_faster_whisper_directory(
+    path: &Path,
+    root: &Path,
+    root_order: usize,
+) -> Option<ModelEntry> {
+    let model_file = path.join("model.bin");
+    let config_file = path.join("config.json");
+    let tokenizer_file = path.join("tokenizer.json");
+    if !model_file.is_file() || !config_file.is_file() || !tokenizer_file.is_file() {
+        return None;
+    }
+    let size_bytes = std::fs::metadata(&model_file).ok()?.len();
+    if size_bytes == 0 {
+        return None;
+    }
+    let config = std::fs::read(&config_file).ok()?;
+    let parsed: serde_json::Value = serde_json::from_slice(&config).ok()?;
+    if !parsed.is_object() {
+        return None;
+    }
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("faster-whisper")
+        .to_string();
+    Some(ModelEntry {
+        id: format!("faster-whisper:{}", path.display()),
+        name,
+        path: path.to_path_buf(),
+        root: root.to_path_buf(),
+        root_order,
+        size_bytes,
+        format: ModelFormat::Other,
+        role: ModelRole::SpeechRecognition,
+        status: ModelStatus::Validated,
+        architecture: Some("ctranslate2-whisper".into()),
+        detail: "Lokales faster-whisper-Modellbundle strukturell geprüft; Python-/Runtime-Verfügbarkeit wird erst beim Jobstart geprüft.".into(),
+    })
 }
 
 /// Zweck: Prüft Dateimetadaten, erkennt Format/Rolle und validiert GGUF-Header vor der Runtime-Freigabe.
@@ -836,6 +889,32 @@ mod tests {
         assert_eq!(
             snapshot.consumers()[0].state,
             CapabilityState::ModelAvailable
+        );
+    }
+
+    /// Zweck: Prüft die strukturelle Erkennung eines lokalen faster-whisper-Ordners ohne Python-Runtime-Fallback.
+    /// Eingaben: Temporärer ASR-Ordner mit Modellbinary, JSON-Konfiguration und Tokenizerfixture.
+    /// Ausgabe: Keine Rückgabe; Assertions trennen lokales Bundle von zur Laufzeit noch zu prüfender Workerabhängigkeit.
+    #[test]
+    fn recognizes_local_faster_whisper_directory_bundle() {
+        let temp = tempfile::tempdir().unwrap();
+        let model = temp.path().join("asr/large-v3");
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(model.join("model.bin"), b"local-model-fixture").unwrap();
+        std::fs::write(model.join("config.json"), b"{}").unwrap();
+        std::fs::write(model.join("tokenizer.json"), b"{}").unwrap();
+        let snapshot = ModelRegistry::scan([temp.path()]);
+        let entry = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.path == model)
+            .unwrap();
+        assert_eq!(entry.role, ModelRole::SpeechRecognition);
+        assert_eq!(entry.status, ModelStatus::Validated);
+        assert_eq!(entry.architecture.as_deref(), Some("ctranslate2-whisper"));
+        assert_eq!(
+            snapshot.consumers()[1].state,
+            CapabilityState::RuntimePending
         );
     }
 

@@ -86,3 +86,24 @@ Frühere Windows-Ergebnisse auf RAZOR; Cargo-Abhängigkeiten wurden offline und 
 - Nach der deutschen Domainänderung wurden der komplette CUDA-Workspace-Test und ein 28-Layer-GGUF-Smoke-Test erneut ausgeführt. Der Smoke-Test bestand: 28/34 Layer ausgelagert, Laden 12,024 s, Inferenz 1,430 s, 6 Tokens, 4,2 Tokens/s für den kurzen Prompt. Frühere Reloads lagen bei 2,663 s; Cache-/Kaltstartbedingungen wurden nicht kontrolliert, deshalb ist die Ladezeit nicht als feste Startzeit zu interpretieren.
 - Die Smoke-Tests prüfen Laden und Token-Ausgabe, nicht semantische Antwortqualität; ein kurzer Testlauf begann mit dem Rollentext `user`. Musiktheoretische Antwortqualität und ein produktionsreifer Prompt sind noch offen.
 - Nicht ausgeführt: Clippy sowie Builds auf Android/iOS; Audioaufnahme und Echtzeit-Latenz sind noch nicht implementiert oder gemessen.
+
+## Zwei Gesamt-Slices — Umsetzungsstand 2026-11-08
+
+### Slice 1: GUI
+
+- Abgeschlossen: dreispaltige Slint-Workstation mit Projekt-, Audioeingangs-, Analyse-, Timeline-, Tab/Lyrics- und Dev-Observer-Bereichen in `crates/livetab-app/ui/main.slint`.
+- Die 27 Slint-Callbacks sind an `AppController`/`app_workflows.rs` angeschlossen; Status- und Ereignisweitergabe erfolgt über die Core-Schnittstellen. Die Slint-Datei wurde mit dem Offline-Parser-Harness syntaktisch validiert.
+- Windows-Dateiauswahl und Audioeingangs-/Wiedergabe-Adapter sind im App-Quellcode verdrahtet. Wegen des ausstehenden vollständigen App-Builds wurden native Dialoge und echte Audiogeräte in dieser Runde nicht interaktiv end-to-end verifiziert.
+
+### Slice 2: Logik und Workflows
+
+- Abgeschlossen im Quellcode: getrennte Core-Schicht für WAV-Ein-/Ausgabe, Chroma-/Pitch-DSP, Live-Ringbuffer, Akkord-/Tonartbestimmung samt Alternativen, optimierende Griffbrett-Fingersätze mit ASCII-Tab-Ausgabe, Lyrics-Transkriptions-/Alignment-Worker, synchronisierte Wiedergabe sowie EventBus, JobManager und Observability.
+- Die Lyrics-Ausrichtung erhält die erkannte Sprache. Der Modellkatalog behält Qwen3.5-4B Q4_K_M als festen Standard bei; Tests schützen die Manifest-/Registry-Konsistenz.
+- Finaler Offline-Corelauf mit der bereits vorhandenen Stable-Toolchain unter `C:\Users\ralle\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin`: `cargo test --manifest-path .work\core-offline-harness\Cargo.toml --all-targets --offline` — **55 bestanden, 0 fehlgeschlagen, 0 ignoriert**, ohne Compilerwarnungen.
+- Zusätzlich bestanden: `cargo fmt --all -- --check`, `git diff --check` und der Offline-Slint-Parserlauf. Die beiden Slices wurden vor diesen abschließenden Prüfungen fertiggestellt; es wurde keine globale Toolchain umgestellt.
+
+### Buildgrenze und offene Verifikation
+
+- Der vollständige Workspace-/App-Build ist **nicht bestätigt**. Der Windows-Audiopfad benötigt `wasapi`, das im lokalen `.cargo`-Cache nicht vorhanden ist. Die vorhandene `C:\Users\ralle\.cargo\config.toml` enthält nur eine Linker-Konfiguration und keinen Registry-Relay/Mirror.
+- `cargo fetch --locked --manifest-path Cargo.toml` wurde mit der vorhandenen Cargo-Konfiguration versucht, scheiterte jedoch bereits beim Abruf von `https://index.crates.io/config.json` mit SChannel `SEC_E_NO_CREDENTIALS`; daher konnte die fehlende Abhängigkeit nicht geladen und der komplette App-Build nicht erneut verifiziert werden. Es wurde keine TLS-Prüfung abgeschaltet und kein Ersatz-Crate improvisiert.
+- Android-/iOS-Builds, native Geräte-/Dialog-Laufzeit, Clippy und reale Live-Audio-Latenz bleiben offen. Die 55 Core-Tests sind ein Offline-Harness-Ergebnis und ersetzen keinen vollständigen Workspace-Build.

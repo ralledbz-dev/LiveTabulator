@@ -1,67 +1,218 @@
-import { AboutSlint, Button, LineEdit } from "std-widgets.slint";
+/*
+===============================================================================
+Division By Zeros (DBZS)
+Projekt: DBZS LiveTabulator
+Datei: main.slint
+Zweck: Native, responsive Slint-Workstation für Audioanalyse, Tabulatur,
+       Lyrics, Playback, Projekte, lokale Modelle und Diagnose.
+Sprache: Slint
+Hinweise:
+- Diese Oberfläche enthält nur Darstellung und Nutzerinteraktionen.
+- Fachlogik wird ausschließlich über dokumentierte Rust-Callbacks angefordert.
+- Längen Textinhalte umbrechen; Status und Diagnose bleiben sichtbar.
+===============================================================================
+*/
+import { AboutSlint, Button, ComboBox, LineEdit } from "std-widgets.slint";
 
 export component MainWindow inherits Window {
-    title: "DBZS LiveTabulator — lokale Runtime";
-    preferred-width: 1120px;
-    preferred-height: 760px;
-    min-width: 920px;
-    min-height: 640px;
+    title: "DBZS LiveTabulator";
+    preferred-width: 1500px;
+    preferred-height: 980px;
+    min-width: 1080px;
+    min-height: 720px;
     background: #090b12;
 
-    in-out property <string> status_text: "Modellscan wird vorbereitet …";
-    in-out property <string> model_list_text: "Noch keine Modellliste geladen.";
-    in-out property <string> runtime_status_text: "llama.cpp-Runtime noch nicht geladen.";
-    in-out property <string> prompt_text: "Erkläre kurz auf Deutsch, was ein D-Dur-Akkord ist.";
-    in-out property <string> output_text: "Antworten erscheinen hier. Die Inferenz läuft lokal und außerhalb des UI-Threads.";
-    in-out property <bool> model_found: false;
-    in-out property <bool> runtime_loaded: false;
+    in-out property <string> status_text: "Bereit · lokale Verarbeitung";
+    in-out property <string> audio_status_text: "Keine Audioquelle ausgewählt.";
+    in-out property <string> audio_device_status_text: "Audioendpunkte noch nicht aufgelistet.";
+    in-out property <[string]> audio_device_names: [];
+    in-out property <string> worker_status_text: "Analyse-Worker bereit";
+    in-out property <string> current_chord_text: "—";
+    in-out property <string> chord_correction_text: "";
+    in-out property <string> current_key_text: "Tonart offen";
+    in-out property <string> bpm_text: "— BPM";
+    in-out property <string> confidence_text: "Konfidenz —";
+    in-out property <string> waveform_text: "Noch keine Audioframes. Importiere eine WAV-Datei oder starte die Live-Aufnahme.";
+    in-out property <string> chord_timeline_text: "Noch keine Akkordereignisse.";
+    in-out property <string> beatgrid_text: "Beatgrid noch nicht berechnet.";
+    in-out property <string> tab_text: "Noch keine Gitarrentabulatur.";
+    in-out property <string> lyrics_text: "Noch keine Lyrics. Starte einen lokalen Lyrics-Job, sofern ein passendes Modell verfügbar ist.";
+    in-out property <string> fretboard_text: "EADGBE · Standardstimmung";
+    in-out property <string> scales_text: "Skalenempfehlungen erscheinen nach der Tonart-Erkennung.";
+    in-out property <string> tracks_text: "Original  0 dB\nDrums     0 dB\nBass      0 dB\nOther     0 dB\nVocals    0 dB\nGitarre   0 dB\nMetronom  0 dB";
+    in-out property <string> observer_text: "Observer wartet auf Ereignisse.";
+    in-out property <string> project_status_text: "Noch kein Projekt geöffnet.";
+    in-out property <string> project_path_text: "";
+    in-out property <string> audio_path_text: "";
+    in-out property <string> export_path_text: "";
+    in-out property <string> model_list_text: "Modellscan noch nicht ausgeführt.";
+    in-out property <string> model_status_text: "Qwen3.5-4B Q4_K_M · lokales Standardmodell";
+    in-out property <string> prompt_text: "Erkläre kurz die aktuelle Akkordfolge.";
+    in-out property <string> assistant_output_text: "Lokale Musiktheorie-Erklärungen erscheinen hier.";
+    in-out property <string> playback_position_text: "00:00.0 / 00:00.0";
+    in-out property <string> lyrics_edit_text: "";
+    in-out property <int> lyrics_line_index: 0;
+    in-out property <float> correction_time_seconds: 0;
+    in-out property <string> downbeat_offset_text: "0.000";
+    in-out property <string> selection_status_text: "Nichts ausgewählt";
+    in-out property <int> tempo_percent: 100;
+    in-out property <bool> live_running: false;
+    in-out property <bool> recording: false;
+    in-out property <bool> deep_running: false;
+    in-out property <bool> playback_running: false;
+    in-out property <bool> playback_paused: false;
     in-out property <bool> busy: false;
-    in-out property <string> bandmap_path_text: "";
-    in-out property <bool> bandmap_file_picker_available: false;
-    in-out property <string> project_status_text: "Noch kein BANDMAP-Projekt importiert.";
     in-out property <bool> project_busy: false;
     in-out property <bool> scanning: false;
+    in-out property <bool> model_found: false;
+    in-out property <bool> runtime_loaded: false;
+    in-out property <bool> bandmap_file_picker_available: false;
+    in-out property <bool> show_observer: true;
+    in-out property <bool> show_models: false;
     in-out property <bool> show_about: false;
+    in-out property <bool> loop_enabled: false;
 
-    // Zweck: Fordert den Rust-Backend-Scan der Modell-Registry an.
-    // Eingaben: Keine Callback-Argumente; Scanoptionen werden im Rust-Backend verwaltet.
-    // Ausgabe: Kein Rückgabewert; signalisiert den Scanwunsch an die Anwendung.
-    callback scan_requested();
-    // Zweck: Fordert das Laden des ausgewählten lokalen GGUF-Modells an.
-    // Eingaben: Keine Callback-Argumente; der Modellpfad stammt aus dem Registry-Zustand.
-    // Ausgabe: Kein Rückgabewert; signalisiert den Ladeauftrag an die Anwendung.
+    // Zweck: Fordert den Import und die Validierung einer lokalen Audiodatei an.
+    // Eingaben: Keine Callback-Argumente; der Quellpfad stammt aus `audio_path_text`.
+    // Ausgabe: Kein Rückgabewert; der Rust-Controller startet den Importworker.
+    callback open_audio_requested();
+    // Zweck: Fordert die plattformgeeignete Live-Audioaufnahme an.
+    // Eingaben: Keine; Geräteauswahl und Berechtigungen werden vom Backend verwaltet.
+    // Ausgabe: Kein Rückgabewert; signalisiert den Startwunsch an den Audio-Service.
+    callback start_live_requested();
+    // Zweck: Lädt die aktiven Windows-Render-Endpunkte oder die plattformnative lokale Eingabe.
+    // Eingaben: Keine; die Auflistung läuft auf einem separaten COM-/Audio-Worker.
+    // Ausgabe: Kein Rückgabewert; verfügbare Geräte werden dem ComboBox-Modell übergeben.
+    callback scan_audio_devices_requested();
+    // Zweck: Übernimmt die vom Nutzer gewählte Audioquelle für den nächsten Live-Start.
+    // Eingaben: `device_name` – angezeigter aktiver Endpunkt.
+    // Ausgabe: Kein Rückgabewert; die Quelle wird lokal gespeichert und beim nächsten Start geöffnet.
+    callback audio_device_selected(string);
+    // Zweck: Startet oder beendet die begrenzte WAV-Aufzeichnung der aktiven lokalen Livequelle.
+    // Eingaben: Keine; beim Beenden wird ein lokales WAV-Ziel ausgewählt.
+    // Ausgabe: Kein Rückgabewert; gespeicherte PCM-Samples werden im Hintergrund geschrieben.
+    callback toggle_recording_requested();
+    // Zweck: Fordert das kontrollierte Beenden der Live-Aufnahme an.
+    // Eingaben: Keine.
+    // Ausgabe: Kein Rückgabewert; signalisiert den Stoppwunsch an den Audio-Service.
+    callback stop_live_requested();
+    // Zweck: Startet die getrennte Offline-Analyse der ausgewählten Audiodatei.
+    // Eingaben: Keine; die Audioquelle stammt aus dem Projektzustand.
+    // Ausgabe: Kein Rückgabewert; startet einen abbrechbaren Analysejob.
+    callback run_deep_analysis_requested();
+    // Zweck: Bricht den laufenden Deep-Analysejob kooperativ zwischen DSP-Frames ab.
+    // Eingaben: Keine.
+    // Ausgabe: Kein Rückgabewert; signalisiert dem JobManager den Abbruchwunsch.
+    callback cancel_deep_analysis_requested();
+    // Zweck: Startet oder pausiert den musikalisch synchronisierten Playback-Scheduler.
+    // Eingaben: Keine; Song, Tempo, Loop und Spurzustand stammen aus dem Projektmodell.
+    // Ausgabe: Kein Rückgabewert; delegiert den Wiedergabebefehl an den Controller.
+    callback toggle_playback_requested();
+    // Zweck: Stoppt Playback und setzt den Wiedergabecursor zurück.
+    // Eingaben: Keine.
+    // Ausgabe: Kein Rückgabewert; delegiert den Stopp an den Playback-Service.
+    callback stop_playback_requested();
+    // Zweck: Ändert die Loop-Wiederholung des aktuellen Playback-Bereichs.
+    // Eingaben: `enabled` – neuer Loopzustand.
+    // Ausgabe: Kein Rückgabewert; der Controller validiert den Bereich.
+    callback loop_changed(bool);
+    // Zweck: Fordert eine Änderung des Wiedergabetempos an.
+    // Eingaben: `percent` – Tempo als Prozent des Songtempos.
+    // Ausgabe: Kein Rückgabewert; der Playback-Service wendet die Änderung an.
+    callback tempo_changed(int);
+    // Zweck: Erzeugt Gitarrentabs aus vorhandenen Noten-/Akkordereignissen.
+    // Eingaben: Keine; Stimmung, Modus und Schwierigkeitsgrad kommen aus dem Projekt.
+    // Ausgabe: Kein Rückgabewert; ein Tab-Workflow meldet Ergebnis und Warnungen.
+    callback generate_tabs_requested();
+    // Zweck: Startet die getrennte Lyrics-Transkription und Beatgrid-Ausrichtung.
+    // Eingaben: Keine; Sprache und lokale Modellprofile kommen aus Einstellungen.
+    // Ausgabe: Kein Rückgabewert; der Lyrics-Job läuft unabhängig von Live-Audio.
+    callback start_lyrics_requested();
+    // Zweck: Speichert den aktuellen Songzustand als lokales LiveTab-Projekt.
+    // Eingaben: Keine; Speicherort wird im Controller aus Pfad und Projektstatus bestimmt.
+    // Ausgabe: Kein Rückgabewert; startet die Persistenz außerhalb der UI.
+    callback save_project_requested();
+    // Zweck: Öffnet einen gespeicherten lokalen LiveTab-Projektpfad.
+    // Eingaben: Keine; der Projektpfad steht in `project_path_text`.
+    // Ausgabe: Kein Rückgabewert; der Controller validiert und lädt das Projekt.
+    callback open_project_requested();
+    // Zweck: Exportiert den Song in das angeforderte portable Austauschformat.
+    // Eingaben: `format` – unterstützte Endung wie `txt`, `lrc`, `srt`, `mid`, `json` oder `dbztab`.
+    // Ausgabe: Kein Rückgabewert; der Exportjob meldet Speicherort oder Fehler.
+    callback export_requested(string);
+    // Zweck: Übernimmt einen vom Nutzer korrigierten Akkord in das Songmodell.
+    // Eingaben: `time_seconds` – Startzeit; `chord_name` – gewünschte Akkordbezeichnung.
+    // Ausgabe: Kein Rückgabewert; der Controller validiert die Korrektur und aktualisiert Timeline/Projekt.
+    callback correct_chord_requested(float, string);
+    // Zweck: Verschiebt den ersten Beat des analysierten Beatgrids auf den eingegebenen Audiooffset.
+    // Eingaben: `offset_seconds` – endliche, nichtnegative Position in Sekunden.
+    // Ausgabe: Kein Rückgabewert; der Controller validiert und veröffentlicht das neue Beatgrid.
+    callback correct_downbeat_requested(string);
+    // Zweck: Übernimmt eine vom Nutzer bearbeitete Lyrics-Zeile.
+    // Eingaben: `line_index` – nullbasierter Zeilenindex; `text` – korrigierter Text.
+    // Ausgabe: Kein Rückgabewert; der Lyrics-Service speichert die Änderung.
+    callback edit_lyrics_requested(int, string);
+    // Zweck: Fordert das rekursive Durchsuchen der Modellwurzeln an.
+    // Eingaben: Keine; externe Modellpfade werden nur auf ausdrückliche Nutzeraktion geprüft.
+    // Ausgabe: Kein Rückgabewert; der Registry-Worker meldet Fortschritt und Modellstatus.
+    callback scan_models_requested();
+    // Zweck: Lädt das validierte lokale Standardmodell für Musiktheorie-Erklärungen.
+    // Eingaben: Keine; Modellpfad stammt ausschließlich aus der geprüften Registry.
+    // Ausgabe: Kein Rückgabewert; der llama.cpp-Worker lädt das Modell asynchron.
     callback load_model_requested();
-    // Zweck: Fordert eine lokale Inferenz mit dem aktuellen Prompt an.
-    // Eingaben: Keine Callback-Argumente; der Prompt ist in `prompt_text` gebunden.
-    // Ausgabe: Kein Rückgabewert; signalisiert den Inferenzauftrag an die Anwendung.
+    // Zweck: Führt den aktuellen Assistentenprompt ausschließlich mit dem lokalen Modell aus.
+    // Eingaben: Keine; der Prompt steht in `prompt_text`.
+    // Ausgabe: Kein Rückgabewert; die lokale Runtime meldet Text und Fehlerstatus.
     callback generate_requested();
-    // Zweck: Fordert den geprüften Import eines lokalen BANDMAP-Containers an.
-    // Eingaben: Keine Callback-Argumente; der `.bandmap`-Pfad stammt aus `bandmap_path_text`.
-    // Ausgabe: Kein Rückgabewert; signalisiert den Importauftrag an den Rust-Worker.
+    // Zweck: Startet den sicheren Import eines eingegebenen BANDMAP-Containers.
+    // Eingaben: Keine; der Quellpfad steht in `project_path_text`.
+    // Ausgabe: Kein Rückgabewert; der Importworker validiert und persistiert das Archiv.
     callback import_bandmap_requested();
-    // Zweck: Fordert die Auswahl einer `.bandmap`-Datei mit anschließendem Import an.
-    // Eingaben: Keine Callback-Argumente; der Dateipfad kommt aus dem plattformspezifischen Dialog.
-    // Ausgabe: Kein Rückgabewert; signalisiert Auswahl und Import an den Rust-Backend-Worker.
+    // Zweck: Öffnet den nativen `.bandmap`-Auswahldialog, sofern die Plattform ihn unterstützt.
+    // Eingaben: Keine.
+    // Ausgabe: Kein Rückgabewert; Auswahl und Import werden an den Backend-Worker delegiert.
     callback select_bandmap_requested();
+    // Zweck: Wählt und öffnet eine Audiodatei über den nativen Dateidialog.
+    // Eingaben: Keine.
+    // Ausgabe: Kein Rückgabewert; der Controller startet Import und Analysevorbereitung.
+    callback select_audio_requested();
+    // Zweck: Öffnet einen nativen Dialog für Projekt- oder Exportdateien.
+    // Eingaben: `kind` – `project` oder `export` zur Auswahl des Dialogfilters.
+    // Ausgabe: Kein Rückgabewert; Auswahl wird im App-Controller verarbeitet.
+    callback select_path_requested(string);
 
     VerticalLayout {
         spacing: 0px;
+
         Rectangle {
-            height: 66px;
+            height: 62px;
             background: #0d1019;
             HorizontalLayout {
-                padding-left: 24px;
-                padding-right: 24px;
+                padding-left: 20px;
+                padding-right: 20px;
                 spacing: 14px;
-                Text { text: "DBZS"; color: #aa85ff; font-size: 27px; font-weight: 700; }
-                Text { text: "LIVE TABULATOR"; color: #eef0fa; font-size: 17px; font-weight: 600; }
-                Text { text: "RUST CORE  ·  SLINT  ·  LOKALE INFERENZ"; color: #858aa1; font-size: 11px; }
+                Text { text: "DBZS"; color: #aa85ff; font-size: 25px; font-weight: 700; }
+                Text { text: "LIVE TABULATOR"; color: #eef0fa; font-size: 16px; font-weight: 700; }
+                Text { text: "MUSIK-ANALYSE · TABS · PLAYBACK"; color: #858aa1; font-size: 10px; }
                 Rectangle { horizontal-stretch: 1; background: transparent; }
+                Rectangle {
+                    width: 11px; height: 11px; border-radius: 6px;
+                    background: root.live_running ? #74e0ad : #686e82;
+                }
+                Text { text: root.live_running ? "LIVE" : "BEREIT"; color: root.live_running ? #83d9ac : #aab0c3; font-size: 11px; font-weight: 700; }
+                Text { text: root.status_text; color: #aeb4c8; font-size: 11px; wrap: word-wrap; }
+                Button {
+                    text: root.show_observer ? "Observer −" : "Observer +";
+                    // Zweck: Klappt das Diagnosepanel ein oder aus.
+                    // Eingaben: Mausklick auf den Observer-Schalter.
+                    // Ausgabe: Kein Rückgabewert; ändert nur die sichtbare UI-Eigenschaft.
+                    clicked => { root.show_observer = !root.show_observer; }
+                }
                 Button {
                     text: root.show_about ? "Schließen" : "Über";
-                    // Zweck: Öffnet oder schließt das Infofeld.
-                    // Eingaben: Das Slint-Klickereignis.
-                    // Ausgabe: Kein Rückgabewert; schaltet die Eigenschaft `show_about` um.
+                    // Zweck: Öffnet oder schließt den Slint-Lizenz- und Produktdialog.
+                    // Eingaben: Mausklick auf die Info-Schaltfläche.
+                    // Ausgabe: Kein Rückgabewert; ändert nur die sichtbare UI-Eigenschaft.
                     clicked => { root.show_about = !root.show_about; }
                 }
             }
@@ -69,106 +220,177 @@ export component MainWindow inherits Window {
         Rectangle { height: 1px; background: #272a3a; }
 
         HorizontalLayout {
-            padding: 22px;
-            spacing: 18px;
+            padding: 14px;
+            spacing: 12px;
+            vertical-stretch: 1;
 
             VerticalLayout {
-                width: 430px;
-                spacing: 14px;
+                width: 258px;
+                spacing: 10px;
 
                 Rectangle {
-                    background: #111522;
-                    border-color: #292d42;
-                    border-width: 1px;
-                    border-radius: 12px;
+                    height: 184px;
+                    background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
                     VerticalLayout {
-                        padding: 18px;
-                        spacing: 10px;
-                        Text { text: "MODELL-REGISTRY"; color: #b49aff; font-size: 12px; font-weight: 700; }
-                        Text {
-                            text: "Festes Standardmodell: Qwen3.5-4B Q4_K_M. App- und weitere Modellwurzeln werden geprüft; andere GGUFs sind kein Assistant-Ersatz.";
-                            color: #c5c8d6;
-                            font-size: 13px;
-                            wrap: word-wrap;
+                        padding: 13px; spacing: 7px;
+                        Text { text: "PROJEKT"; color: #b49aff; font-size: 11px; font-weight: 700; }
+                        LineEdit { text <=> root.project_path_text; enabled: !root.project_busy; }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Button {
+                                text: "Öffnen"; enabled: !root.project_busy;
+                                // Zweck: Fordert das Öffnen des angegebenen Projekts an.
+                                // Eingaben: Mausklick; der Dateipfad ist an `project_path_text` gebunden.
+                                // Ausgabe: Kein Rückgabewert; ruft den App-Controller auf.
+                                clicked => { root.open_project_requested(); }
+                            }
+                            Button {
+                                text: "Speichern"; enabled: !root.project_busy;
+                                // Zweck: Speichert das aktive Projekt.
+                                // Eingaben: Mausklick.
+                                // Ausgabe: Kein Rückgabewert; ruft den Persistenzworkflow auf.
+                                clicked => { root.save_project_requested(); }
+                            }
                         }
                         Button {
-                            text: root.scanning ? "Suche läuft …" : "Modelle scannen";
-                            enabled: !root.busy && !root.scanning;
-                            // Zweck: Löst über den Scan-Button den Registry-Scan aus.
-                            // Eingaben: Das Slint-Klickereignis.
-                            // Ausgabe: Kein Rückgabewert; ruft `scan_requested` auf.
-                            clicked => { root.scan_requested(); }
-                        }
-                        Text {
-                            text: root.status_text;
-                            color: #e0e3ef;
-                            font-size: 12px;
-                            wrap: word-wrap;
-                        }
-                        Text {
-                            text: root.model_list_text;
-                            color: #aeb4c8;
-                            font-size: 11px;
-                            wrap: word-wrap;
-                            vertical-stretch: 1;
-                        }
-                    }
-                }
-
-                Rectangle {
-                    height: 116px;
-                    background: #111522;
-                    border-color: #292d42;
-                    border-width: 1px;
-                    border-radius: 12px;
-                    VerticalLayout {
-                        padding: 16px;
-                        spacing: 8px;
-                        Text { text: "ANALYSE-CORE"; color: #b49aff; font-size: 12px; font-weight: 700; }
-                        Text { text: "Akkord-Templates und Tonartprofil sind im Rust-Core eingebaut; sie benötigen keine LLM-Inferenz."; color: #c5c8d6; font-size: 12px; wrap: word-wrap; }
-                        Text { text: "Hardware- und Echtzeitmetriken werden erst angezeigt, wenn sie am Gerät tatsächlich gemessen werden."; color: #858aa1; font-size: 11px; wrap: word-wrap; }
-                    }
-                }
-
-                Rectangle {
-                    height: 208px;
-                    background: #111522;
-                    border-color: #292d42;
-                    border-width: 1px;
-                    border-radius: 12px;
-                    VerticalLayout {
-                        padding: 16px;
-                        spacing: 8px;
-                        Text { text: "BANDMAP-PROJEKT"; color: #b49aff; font-size: 12px; font-weight: 700; }
-                        Text { text: "V1/V2-Recovery und V3-Portable-Container importieren und lokal sichern."; color: #c5c8d6; font-size: 12px; wrap: word-wrap; }
-                        LineEdit {
-                            text <=> root.bandmap_path_text;
+                            text: root.project_busy ? "Import läuft …" : "BANDMAP importieren";
                             enabled: !root.project_busy;
+                            // Zweck: Startet den sicheren Import eines eingetragenen BANDMAP-Pfads.
+                            // Eingaben: Mausklick; Pfad steht in `project_path_text`.
+                            // Ausgabe: Kein Rückgabewert; startet den Importworker.
+                            clicked => { root.import_bandmap_requested(); }
+                        }
+                        Button {
+                            text: root.bandmap_file_picker_available ? "Datei wählen …" : "Dateiauswahl nicht verfügbar";
+                            enabled: root.bandmap_file_picker_available && !root.project_busy;
+                            // Zweck: Öffnet den nativen BANDMAP-Dialog auf unterstützten Plattformen.
+                            // Eingaben: Mausklick.
+                            // Ausgabe: Kein Rückgabewert; Auswahl wird importiert.
+                            clicked => { root.select_bandmap_requested(); }
+                        }
+                        Text { text: root.project_status_text; color: #aeb4c8; font-size: 10px; wrap: word-wrap; vertical-stretch: 1; }
+                    }
+                }
+
+                Rectangle {
+                    height: 300px;
+                    background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                    VerticalLayout {
+                        padding: 13px; spacing: 7px;
+                        Text { text: "AUDIO INPUT"; color: #b49aff; font-size: 11px; font-weight: 700; }
+                        Text { text: root.audio_status_text; color: #c5c8d6; font-size: 10px; wrap: word-wrap; }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            ComboBox {
+                                horizontal-stretch: 1;
+                                model: root.audio_device_names;
+                                enabled: !root.live_running;
+                                selected(value) => { root.audio_device_selected(value); }
+                            }
+                            Button {
+                                text: "Geräte"; enabled: !root.live_running;
+                                // Zweck: Lädt die verfügbaren lokalen Audioquellen.
+                                // Eingaben: Mausklick.
+                                // Ausgabe: Kein Rückgabewert; die Geräte erscheinen im Auswahlfeld.
+                                clicked => { root.scan_audio_devices_requested(); }
+                            }
+                        }
+                        Text { text: root.audio_device_status_text; color: #858aa1; font-size: 9px; wrap: word-wrap; }
+                        LineEdit { text <=> root.audio_path_text; enabled: !root.busy; }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Button {
+                                text: "Datei wählen"; enabled: !root.busy;
+                                // Zweck: Öffnet den nativen Audiodateidialog.
+                                // Eingaben: Mausklick.
+                                // Ausgabe: Kein Rückgabewert; Auswahl wird dem Controller gemeldet.
+                                clicked => { root.select_audio_requested(); }
+                            }
+                            Button {
+                                text: "WAV öffnen"; enabled: !root.busy;
+                                // Zweck: Importiert und prüft die eingetragene WAV-Audiodatei.
+                                // Eingaben: Mausklick; Quellpfad stammt aus `audio_path_text`.
+                                // Ausgabe: Kein Rückgabewert; startet den Audioimport.
+                                clicked => { root.open_audio_requested(); }
+                            }
                         }
                         HorizontalLayout {
-                            spacing: 8px;
+                            spacing: 6px;
                             Button {
-                                text: root.bandmap_file_picker_available ? "Datei wählen & importieren" : "Dateiauswahl nur unter Windows";
-                                enabled: root.bandmap_file_picker_available && !root.project_busy;
-                                // Zweck: Öffnet den nativen Dateidialog und übergibt die Auswahl an den Prüf-/Importablauf.
-                                // Eingaben: Das Slint-Klickereignis; der Dialogfilter bietet `.bandmap`-Dateien an.
-                                // Ausgabe: Kein Rückgabewert; ruft `select_bandmap_requested` auf.
-                                clicked => { root.select_bandmap_requested(); }
+                                text: root.live_running ? "Aufnahme läuft" : "Live starten";
+                                enabled: !root.live_running && !root.busy;
+                                // Zweck: Startet die passende plattformspezifische Liveaufnahme.
+                                // Eingaben: Mausklick.
+                                // Ausgabe: Kein Rückgabewert; startet den Capture-Service.
+                                clicked => { root.start_live_requested(); }
                             }
                             Button {
-                                text: root.project_busy ? "Import läuft …" : "Pfad importieren";
-                                enabled: !root.project_busy;
-                                // Zweck: Startet den nicht-blockierenden Import des eingetragenen BANDMAP-Pfads.
-                                // Eingaben: Das Slint-Klickereignis; der Pfad ist an `bandmap_path_text` gebunden.
-                                // Ausgabe: Kein Rückgabewert; ruft den Rust-Importcallback auf.
-                                clicked => { root.import_bandmap_requested(); }
+                                text: "Live stoppen"; enabled: root.live_running && !root.recording;
+                                // Zweck: Beendet die laufende Liveaufnahme.
+                                // Eingaben: Mausklick.
+                                // Ausgabe: Kein Rückgabewert; stoppt den Capture-Service.
+                                clicked => { root.stop_live_requested(); }
+                            }
+                            Button {
+                                text: root.recording ? "WAV sichern" : "WAV aufnehmen";
+                                enabled: root.live_running;
+                                // Zweck: Beginnt die Live-WAV-Pufferung oder öffnet beim Stoppen den Speichern-Dialog.
+                                // Eingaben: Mausklick; Aufnahme endet spätestens nach zehn Minuten.
+                                // Ausgabe: Kein Rückgabewert; Writer speichert eine lokale Mono-PCM-WAV.
+                                clicked => { root.toggle_recording_requested(); }
                             }
                         }
-                        Text {
-                            text: root.project_status_text;
-                            color: #d6d9e6;
-                            font-size: 11px;
-                            wrap: word-wrap;
+                        Button {
+                            text: root.deep_running ? "Deep-Analyse läuft …" : "Deep-Analyse starten";
+                            enabled: !root.deep_running && !root.busy;
+                            // Zweck: Startet eine separate, abbrechbare Offlineanalyse.
+                            // Eingaben: Mausklick.
+                            // Ausgabe: Kein Rückgabewert; Live-Audio und UI bleiben unabhängig.
+                            clicked => { root.run_deep_analysis_requested(); }
+                        }
+                        if root.deep_running: Button {
+                            text: "Deep-Analyse abbrechen";
+                            // Zweck: Fordert den Abbruch des separaten DSP-Jobs an.
+                            // Eingaben: Mausklick.
+                            // Ausgabe: Kein Rückgabewert; der Worker prüft die Anforderung zwischen Frames.
+                            clicked => { root.cancel_deep_analysis_requested(); }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    vertical-stretch: 1;
+                    background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                    VerticalLayout {
+                        padding: 13px; spacing: 7px;
+                        Text { text: "ANALYSE & MODELLE"; color: #b49aff; font-size: 11px; font-weight: 700; }
+                        Text { text: root.worker_status_text; color: #83d9ac; font-size: 10px; wrap: word-wrap; }
+                        Text { text: root.model_status_text; color: #c5c8d6; font-size: 10px; wrap: word-wrap; }
+                        Button {
+                            text: root.scanning ? "Modelle werden geprüft …" : "Modellwurzeln scannen";
+                            enabled: !root.scanning && !root.busy;
+                            // Zweck: Startet nur nach Nutzeraktion den rekursiven Modellscan.
+                            // Eingaben: Mausklick.
+                            // Ausgabe: Kein Rückgabewert; meldet Fortschritt über Registry-Status.
+                            clicked => { root.scan_models_requested(); }
+                        }
+                        Button {
+                            text: root.runtime_loaded ? "Runtime bereit" : "Qwen-Runtime laden";
+                            enabled: root.model_found && !root.runtime_loaded && !root.busy;
+                            // Zweck: Lädt das validierte feste Assistant-Modell lokal.
+                            // Eingaben: Mausklick.
+                            // Ausgabe: Kein Rückgabewert; der llama.cpp-Worker lädt asynchron.
+                            clicked => { root.load_model_requested(); }
+                        }
+                        if root.show_models: Text {
+                            text: root.model_list_text; color: #9ea5bb; font-size: 9px; wrap: word-wrap; vertical-stretch: 1;
+                        }
+                        Button {
+                            text: root.show_models ? "Modellliste ausblenden" : "Modellliste anzeigen";
+                            // Zweck: Klappt die bereits geladene Modellübersicht ein oder aus.
+                            // Eingaben: Mausklick.
+                            // Ausgabe: Kein Rückgabewert; ändert nur die Darstellung.
+                            clicked => { root.show_models = !root.show_models; }
                         }
                     }
                 }
@@ -176,94 +398,335 @@ export component MainWindow inherits Window {
 
             VerticalLayout {
                 horizontal-stretch: 1;
-                spacing: 14px;
+                spacing: 10px;
 
                 Rectangle {
-                    background: #111522;
-                    border-color: #292d42;
-                    border-width: 1px;
-                    border-radius: 12px;
+                    height: 108px;
+                    background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                    HorizontalLayout {
+                        padding: 14px; spacing: 10px;
+                        VerticalLayout {
+                            width: 150px; spacing: 4px;
+                            Text { text: "AKTUELLER AKKORD"; color: #9298ae; font-size: 9px; font-weight: 700; }
+                            Text { text: root.current_chord_text; color: #52d9f7; font-size: 31px; font-weight: 700; }
+                            Text { text: root.confidence_text; color: #9ca3ba; font-size: 10px; }
+                        }
+                        Rectangle { width: 1px; background: #292d42; }
+                        VerticalLayout {
+                            width: 150px; spacing: 4px;
+                            Text { text: "TONART & SKALA"; color: #9298ae; font-size: 9px; font-weight: 700; }
+                            Text { text: root.current_key_text; color: #c0a3ff; font-size: 20px; font-weight: 700; }
+                            Text { text: root.scales_text; color: #aeb4c8; font-size: 9px; wrap: word-wrap; vertical-stretch: 1; }
+                        }
+                        Rectangle { width: 1px; background: #292d42; }
+                        VerticalLayout {
+                            width: 100px; spacing: 4px;
+                            Text { text: "TEMPO"; color: #9298ae; font-size: 9px; font-weight: 700; }
+                            Text { text: root.bpm_text; color: #83d9ac; font-size: 20px; font-weight: 700; }
+                            Text { text: "Tempo-Override"; color: #858aa1; font-size: 9px; }
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        VerticalLayout {
+                            width: 140px; spacing: 5px;
+                            Text { text: "JOBSTATUS"; color: #9298ae; font-size: 9px; font-weight: 700; }
+                            Text { text: root.deep_running ? "Deep-Analyse" : (root.live_running ? "Liveanalyse" : "Bereit"); color: #d1d5e4; font-size: 13px; font-weight: 600; }
+                            Text { text: root.selection_status_text; color: #858aa1; font-size: 9px; wrap: word-wrap; }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 130px;
+                    background: #0e121d; border-color: #292d42; border-width: 1px; border-radius: 10px;
                     VerticalLayout {
-                        padding: 18px;
-                        spacing: 12px;
-                        Text { text: "LOKALE LLAMA.CPP-RUNTIME"; color: #b49aff; font-size: 12px; font-weight: 700; }
+                        padding: 12px; spacing: 6px;
+                        HorizontalLayout {
+                            Text { text: "WAVEFORM · PEGEL"; color: #b49aff; font-size: 10px; font-weight: 700; }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Text { text: root.audio_status_text; color: #858aa1; font-size: 9px; wrap: word-wrap; }
+                        }
                         Text {
-                            text: root.runtime_status_text;
-                            color: root.runtime_loaded ? #83d9ac : #d6d9e6;
-                            font-size: 13px;
-                            wrap: word-wrap;
+                            text: root.waveform_text; color: #50d3f2; font-size: 12px; font-family: "Consolas";
+                            wrap: word-wrap; vertical-stretch: 1; vertical-alignment: center;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    vertical-stretch: 1;
+                    background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                    VerticalLayout {
+                        padding: 12px; spacing: 6px;
+                        HorizontalLayout {
+                            Text { text: "AKKORD-TIMELINE"; color: #b49aff; font-size: 10px; font-weight: 700; }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Text { text: root.beatgrid_text; color: #9298ae; font-size: 9px; wrap: word-wrap; }
+                        }
+                        Rectangle { height: 1px; background: #272a3a; }
+                        Text {
+                            text: root.chord_timeline_text; color: #dce0ef; font-size: 11px; font-family: "Consolas";
+                            wrap: word-wrap; vertical-stretch: 1; vertical-alignment: top;
                         }
                         HorizontalLayout {
-                            spacing: 10px;
+                            spacing: 6px;
+                            LineEdit { text <=> root.chord_correction_text; enabled: !root.busy; }
                             Button {
-                                text: "Runtime laden";
-                                enabled: root.model_found && !root.busy && !root.runtime_loaded;
-                                // Zweck: Löst über den Lade-Button das Laden des ausgewählten Modells aus.
-                                // Eingaben: Das Slint-Klickereignis.
-                                // Ausgabe: Kein Rückgabewert; ruft `load_model_requested` auf.
-                                clicked => { root.load_model_requested(); }
-                            }
-                            Button {
-                                text: root.busy ? "Läuft …" : "Prompt lokal ausführen";
-                                enabled: root.runtime_loaded && !root.busy;
-                                // Zweck: Löst über den Prompt-Button eine lokale Inferenz aus.
-                                // Eingaben: Das Slint-Klickereignis; der Prompt wird über `prompt_text` gelesen.
-                                // Ausgabe: Kein Rückgabewert; ruft `generate_requested` auf.
-                                clicked => { root.generate_requested(); }
+                                text: "Korrektur übernehmen"; enabled: !root.busy;
+                                // Zweck: Speichert den aktuell eingegebenen Akkord als manuelle Korrektur.
+                                // Eingaben: Mausklick; Akkordtext wird aus der sichtbaren Akkordanzeige übernommen.
+                                // Ausgabe: Kein Rückgabewert; Änderung wird vom Domänencontroller validiert.
+                                clicked => { root.correct_chord_requested(root.correction_time_seconds, root.chord_correction_text); }
                             }
                         }
-                        Text { text: "PROMPT"; color: #9298ae; font-size: 11px; }
-                        LineEdit {
-                            text <=> root.prompt_text;
-                            enabled: root.runtime_loaded && !root.busy;
-                        }
-                        Text { text: "AUSGABE"; color: #9298ae; font-size: 11px; }
-                        Rectangle {
-                            vertical-stretch: 1;
-                            background: #0b0e16;
-                            border-color: #24283a;
-                            border-width: 1px;
-                            border-radius: 8px;
-                            Text {
-                                x: 12px;
-                                y: 10px;
-                                width: parent.width - 24px;
-                                height: parent.height - 20px;
-                                text: root.output_text;
-                                color: #e2e5ef;
-                                font-size: 13px;
-                                wrap: word-wrap;
-                                vertical-alignment: top;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Text { text: "Downbeat (s)"; color: #9298ae; font-size: 9px; vertical-alignment: center; }
+                            LineEdit { text <=> root.downbeat_offset_text; enabled: !root.busy; }
+                            Button {
+                                text: "Beatgrid verschieben"; enabled: !root.busy;
+                                // Zweck: Übernimmt den nutzerseitig korrigierten ersten Beat des Grids.
+                                // Eingaben: Mausklick; Offset stammt aus `downbeat_offset_text`.
+                                // Ausgabe: Kein Rückgabewert; fachliche Validierung erfolgt im Rust-Core.
+                                clicked => { root.correct_downbeat_requested(root.downbeat_offset_text); }
                             }
                         }
                     }
                 }
 
-                Text {
-                    text: "CPU-only-Prototyp · keine Cloud-Inferenz · Standardmodell: Qwen3.5-4B Q4_K_M · Laufzeit und Modellspeicher sind getrennte Komponenten.";
-                    color: #7e849a;
-                    font-size: 11px;
-                    wrap: word-wrap;
+                HorizontalLayout {
+                    vertical-stretch: 1;
+                    spacing: 10px;
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                        VerticalLayout {
+                            padding: 12px; spacing: 6px;
+                            HorizontalLayout {
+                                Text { text: "GITARREN-TAB"; color: #b49aff; font-size: 10px; font-weight: 700; }
+                                Rectangle { horizontal-stretch: 1; background: transparent; }
+                                Button {
+                                    text: "Tabs erzeugen"; enabled: !root.busy;
+                                    // Zweck: Startet die Tab-Generierung für den aktuellen Song.
+                                    // Eingaben: Mausklick; Stimmung und Modus kommen aus dem Projekt.
+                                    // Ausgabe: Kein Rückgabewert; der Tab-Workflow meldet Ergebnis/Warnungen.
+                                    clicked => { root.generate_tabs_requested(); }
+                                }
+                            }
+                            Text { text: root.tab_text; color: #e0e4f1; font-size: 11px; font-family: "Consolas"; wrap: word-wrap; vertical-stretch: 1; }
+                            Text { text: root.fretboard_text; color: #50d3f2; font-size: 10px; wrap: word-wrap; }
+                        }
+                    }
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                        VerticalLayout {
+                            padding: 12px; spacing: 6px;
+                            HorizontalLayout {
+                                Text { text: "LYRICS & BEATGRID"; color: #b49aff; font-size: 10px; font-weight: 700; }
+                                Rectangle { horizontal-stretch: 1; background: transparent; }
+                                Button {
+                                    text: "Lyrics-Job"; enabled: !root.busy && !root.deep_running;
+                                    // Zweck: Startet Transkription und Beatgrid-Ausrichtung als separaten Job.
+                                    // Eingaben: Mausklick; Sprache und Modellprofil kommen aus den Einstellungen.
+                                    // Ausgabe: Kein Rückgabewert; Lyrics-Worker meldet Fortschritt/Ergebnis.
+                                    clicked => { root.start_lyrics_requested(); }
+                                }
+                            }
+                            Text { text: root.lyrics_text; color: #e0e4f1; font-size: 10px; wrap: word-wrap; vertical-stretch: 1; }
+                            HorizontalLayout {
+                                spacing: 5px;
+                                LineEdit { text <=> root.lyrics_edit_text; enabled: !root.busy; }
+                                Button {
+                                    text: "Zeile speichern"; enabled: !root.busy;
+                                    // Zweck: Speichert die im Lyrics-Editor korrigierte erste Zeile.
+                                    // Eingaben: Mausklick; Text steht in `lyrics_edit_text`.
+                                    // Ausgabe: Kein Rückgabewert; der Controller validiert und aktualisiert Wortzeiten.
+                                    clicked => { root.edit_lyrics_requested(root.lyrics_line_index, root.lyrics_edit_text); }
+                                }
+                            }
+                            Text { text: "Bearbeitungen werden gegen das Songmodell validiert."; color: #858aa1; font-size: 9px; wrap: word-wrap; }
+                        }
+                    }
                 }
+            }
+
+            VerticalLayout {
+                width: 270px;
+                spacing: 10px;
+
+                Rectangle {
+                    height: 204px;
+                    background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                    VerticalLayout {
+                        padding: 13px; spacing: 7px;
+                        Text { text: "FRETBOARD · EADGBE"; color: #b49aff; font-size: 10px; font-weight: 700; }
+                        Text { text: root.fretboard_text; color: #dce0ef; font-size: 10px; font-family: "Consolas"; wrap: word-wrap; vertical-stretch: 1; }
+                        Text { text: "Standardstimmung · Capo 0"; color: #858aa1; font-size: 9px; }
+                        Text { text: "Die Position wird aus NoteEvents und Stimmung berechnet."; color: #858aa1; font-size: 9px; wrap: word-wrap; }
+                    }
+                }
+
+                Rectangle {
+                    height: 142px;
+                    background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                    VerticalLayout {
+                        padding: 13px; spacing: 7px;
+                        Text { text: "SKALEN & MODI"; color: #b49aff; font-size: 10px; font-weight: 700; }
+                        Text { text: root.scales_text; color: #dce0ef; font-size: 10px; wrap: word-wrap; vertical-stretch: 1; }
+                    }
+                }
+
+                Rectangle {
+                    height: 202px;
+                    background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                    VerticalLayout {
+                        padding: 13px; spacing: 6px;
+                        Text { text: "SPUREN & MIXER"; color: #b49aff; font-size: 10px; font-weight: 700; }
+                        Text { text: root.tracks_text; color: #c5c8d6; font-size: 10px; font-family: "Consolas"; wrap: word-wrap; vertical-stretch: 1; }
+                        Text { text: "Spuren- und Lautstärkestatus"; color: #858aa1; font-size: 9px; }
+                    }
+                }
+
+                Rectangle {
+                    vertical-stretch: 1;
+                    background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                    VerticalLayout {
+                        padding: 13px; spacing: 7px;
+                        Text { text: "LOKALER MUSIKASSISTENT"; color: #b49aff; font-size: 10px; font-weight: 700; }
+                        Text { text: root.model_status_text; color: #aeb4c8; font-size: 9px; wrap: word-wrap; }
+                        LineEdit { text <=> root.prompt_text; enabled: root.runtime_loaded && !root.busy; }
+                        Button {
+                            text: root.busy ? "Läuft lokal …" : "Lokal erklären";
+                            enabled: root.runtime_loaded && !root.busy;
+                            // Zweck: Sendet den Prompt an die lokale llama.cpp-Runtime.
+                            // Eingaben: Mausklick; der Prompt ist an `prompt_text` gebunden.
+                            // Ausgabe: Kein Rückgabewert; Ergebnis wird in `assistant_output_text` angezeigt.
+                            clicked => { root.generate_requested(); }
+                        }
+                        Text { text: root.assistant_output_text; color: #dce0ef; font-size: 9px; wrap: word-wrap; vertical-stretch: 1; }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            height: 74px;
+            background: #0d1019;
+            VerticalLayout {
+                padding-left: 16px; padding-right: 16px; spacing: 4px;
+                HorizontalLayout {
+                    spacing: 7px;
+                    Button {
+                        text: root.playback_running && !root.playback_paused ? "Pause" : "Play";
+                        enabled: !root.busy;
+                        // Zweck: Startet oder pausiert den Playback-Scheduler.
+                        // Eingaben: Mausklick.
+                        // Ausgabe: Kein Rückgabewert; Playbackzustand wird im Controller verwaltet.
+                        clicked => { root.toggle_playback_requested(); }
+                    }
+                    Button {
+                        text: "Stop";
+                        // Zweck: Stoppt Wiedergabe und setzt den Cursor zurück.
+                        // Eingaben: Mausklick.
+                        // Ausgabe: Kein Rückgabewert; delegiert an den Playback-Service.
+                        clicked => { root.stop_playback_requested(); }
+                    }
+                    Button {
+                        text: root.loop_enabled ? "Loop: AN" : "Loop: AUS";
+                        // Zweck: Schaltet das Looping des aktuellen Bereichs um.
+                        // Eingaben: Mausklick.
+                        // Ausgabe: Kein Rückgabewert; meldet den neuen Loopzustand an den Controller.
+                        clicked => { root.loop_enabled = !root.loop_enabled; root.loop_changed(root.loop_enabled); }
+                    }
+                    Text { text: "Tempo"; color: #9298ae; font-size: 10px; }
+                    Button {
+                        text: "−5 %";
+                        // Zweck: Senkt das Playbacktempo um fünf Prozentpunkte.
+                        // Eingaben: Mausklick.
+                        // Ausgabe: Kein Rückgabewert; signalisiert den Prozentwert an den Playback-Service.
+                        clicked => { root.tempo_percent = max(50, root.tempo_percent - 5); root.tempo_changed(root.tempo_percent); }
+                    }
+                    Text { text: root.tempo_percent + "%"; color: #83d9ac; font-size: 11px; font-weight: 700; }
+                    Button {
+                        text: "+5 %";
+                        // Zweck: Erhöht das Playbacktempo um fünf Prozentpunkte.
+                        // Eingaben: Mausklick.
+                        // Ausgabe: Kein Rückgabewert; signalisiert den Prozentwert an den Playback-Service.
+                        clicked => { root.tempo_percent = min(150, root.tempo_percent + 5); root.tempo_changed(root.tempo_percent); }
+                    }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    Text { text: root.playback_position_text; color: #dce0ef; font-size: 11px; font-family: "Consolas"; }
+                    Text { text: "·"; color: #555a70; font-size: 14px; }
+                    Text { text: root.beatgrid_text; color: #9298ae; font-size: 9px; wrap: word-wrap; }
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    Text { text: "EXPORT"; color: #9298ae; font-size: 9px; font-weight: 700; }
+                    Button {
+                        text: "TXT";
+                        // Zweck: Exportiert Akkorde, Lyrics und Tabs als Klartext.
+                        // Eingaben: Mausklick; Zielpfad wird vom Controller ermittelt.
+                        // Ausgabe: Kein Rückgabewert; startet den Exportjob.
+                        clicked => { root.export_requested("txt"); }
+                    }
+                    Button {
+                        text: "LRC";
+                        // Zweck: Exportiert zeitmarkierte Lyrics im LRC-Format.
+                        // Eingaben: Mausklick.
+                        // Ausgabe: Kein Rückgabewert; startet den Exportjob.
+                        clicked => { root.export_requested("lrc"); }
+                    }
+                    Button {
+                        text: "MIDI";
+                        // Zweck: Exportiert notierte Ereignisse als Standard-MIDI-Datei.
+                        // Eingaben: Mausklick.
+                        // Ausgabe: Kein Rückgabewert; startet den Exportjob.
+                        clicked => { root.export_requested("mid"); }
+                    }
+                    Button {
+                        text: "Projekt";
+                        // Zweck: Exportiert ein portables LiveTab-Projektarchiv.
+                        // Eingaben: Mausklick.
+                        // Ausgabe: Kein Rückgabewert; startet den Projekt-Export.
+                        clicked => { root.export_requested("dbztab"); }
+                    }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    Text { text: "LIVE AUDIO UNABHÄNGIG VON LLM · CPU/GPU-WERTE NUR GEMESSEN ANZEIGEN"; color: #71778d; font-size: 8px; }
+                }
+            }
+        }
+
+        if root.show_observer: Rectangle {
+            height: 126px;
+            background: #0b0e16;
+            border-color: #272a3a; border-width: 1px;
+            VerticalLayout {
+                padding: 11px; spacing: 5px;
+                HorizontalLayout {
+                    Text { text: "DEV OBSERVER"; color: #b49aff; font-size: 10px; font-weight: 700; }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    Text { text: "Keine ungemessenen Hardwarewerte"; color: #858aa1; font-size: 9px; }
+                }
+                Text { text: root.observer_text; color: #aeb4c8; font-size: 9px; font-family: "Consolas"; wrap: word-wrap; vertical-stretch: 1; vertical-alignment: top; }
             }
         }
     }
 
     if root.show_about: Rectangle {
-        x: root.width - 380px;
-        y: 74px;
-        width: 350px;
+        x: root.width - 360px;
+        y: 70px;
+        width: 340px;
         height: 190px;
         background: #151a29;
         border-color: #4d4070;
         border-width: 1px;
         border-radius: 12px;
         VerticalLayout {
-            padding: 16px;
-            spacing: 10px;
-            Text { text: "ÜBER DBZS LIVETABULATOR"; color: #c5adff; font-size: 13px; font-weight: 700; }
-            Text { text: "Lokale, plattformübergreifend geplante Musikanalyse. Modellinferenz bleibt auf dem Gerät."; color: #d3d6e2; font-size: 12px; wrap: word-wrap; }
+            padding: 14px; spacing: 9px;
+            Text { text: "ÜBER DBZS LIVETABULATOR"; color: #c5adff; font-size: 12px; font-weight: 700; }
+            Text { text: "Lokale, plattformübergreifend geplante Musikanalyse. Live-DSP, Projekte und Playback laufen ohne Cloud-Inferenz."; color: #d3d6e2; font-size: 10px; wrap: word-wrap; }
             AboutSlint { }
         }
     }
 }
+import { AboutSlint, Button, ComboBox, LineEdit } from "std-widgets.slint";
