@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "default_model_id": "qwen3_5_4b_q4_k_m",
+  "models": [
+    {
+      "id": "qwen3_5_4b_q4_k_m",
+      "display_name": "Qwen3.5-4B Agentic Coder v4 (Q4_K_M)",
+      "repository": "mradermacher/qwen3.5-4b-agentic-coder-v4-GGUF",
+      "base_model": "mahiatlinux/qwen3.5-4b-agentic-coder-v4",
+      "filename": "Qwen3.5-4B-Q4_K_M.gguf",
+      "quantization": "Q4_K_M",
+      "license": "Apache-2.0",
+      "role": "language_model",
+      "runtime": "llama.cpp",
+      "local_path": "llm/Qwen3.5-4B-Q4_K_M.gguf",
+      "size_bytes": 2783447520,
+      "sha256": "C1268EF0EC3B0316EA62C081645D7BBAF80CF76288E4F6A590C22A073D64C920",
+      "is_default": true,
+      "status": "runtime_smoke_passed_cpu_and_cuda"
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+Die Dateien in diesem Ordner sind die Slint-UI-Quelle. `build.rs` kompiliert `main.slint` beim Cargo-Build. Das Fenster ist absichtlich zunächst ein Modell-/Runtime-Arbeitsbereich; der umfangreiche Analyse-Control-Desk kommt erst nach Registry- und Runtime-Validierung.

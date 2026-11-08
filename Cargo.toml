@@ -1,0 +1,16 @@
+[workspace]
+members = ["crates/livetab-core", "crates/livetab-app"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.92"
+
+[workspace.metadata.llama-cpp-sys-4.cmake]
+LLAMA_OPENSSL = "OFF"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+walkdir = "2.5"

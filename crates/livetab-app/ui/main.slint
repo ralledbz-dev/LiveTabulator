@@ -1,0 +1,269 @@
+import { AboutSlint, Button, LineEdit } from "std-widgets.slint";
+
+export component MainWindow inherits Window {
+    title: "DBZS LiveTabulator — lokale Runtime";
+    preferred-width: 1120px;
+    preferred-height: 760px;
+    min-width: 920px;
+    min-height: 640px;
+    background: #090b12;
+
+    in-out property <string> status_text: "Modellscan wird vorbereitet …";
+    in-out property <string> model_list_text: "Noch keine Modellliste geladen.";
+    in-out property <string> runtime_status_text: "llama.cpp-Runtime noch nicht geladen.";
+    in-out property <string> prompt_text: "Erkläre kurz auf Deutsch, was ein D-Dur-Akkord ist.";
+    in-out property <string> output_text: "Antworten erscheinen hier. Die Inferenz läuft lokal und außerhalb des UI-Threads.";
+    in-out property <bool> model_found: false;
+    in-out property <bool> runtime_loaded: false;
+    in-out property <bool> busy: false;
+    in-out property <string> bandmap_path_text: "";
+    in-out property <bool> bandmap_file_picker_available: false;
+    in-out property <string> project_status_text: "Noch kein BANDMAP-Projekt importiert.";
+    in-out property <bool> project_busy: false;
+    in-out property <bool> scanning: false;
+    in-out property <bool> show_about: false;
+
+    // Zweck: Fordert den Rust-Backend-Scan der Modell-Registry an.
+    // Eingaben: Keine Callback-Argumente; Scanoptionen werden im Rust-Backend verwaltet.
+    // Ausgabe: Kein Rückgabewert; signalisiert den Scanwunsch an die Anwendung.
+    callback scan_requested();
+    // Zweck: Fordert das Laden des ausgewählten lokalen GGUF-Modells an.
+    // Eingaben: Keine Callback-Argumente; der Modellpfad stammt aus dem Registry-Zustand.
+    // Ausgabe: Kein Rückgabewert; signalisiert den Ladeauftrag an die Anwendung.
+    callback load_model_requested();
+    // Zweck: Fordert eine lokale Inferenz mit dem aktuellen Prompt an.
+    // Eingaben: Keine Callback-Argumente; der Prompt ist in `prompt_text` gebunden.
+    // Ausgabe: Kein Rückgabewert; signalisiert den Inferenzauftrag an die Anwendung.
+    callback generate_requested();
+    // Zweck: Fordert den geprüften Import eines lokalen BANDMAP-Containers an.
+    // Eingaben: Keine Callback-Argumente; der `.bandmap`-Pfad stammt aus `bandmap_path_text`.
+    // Ausgabe: Kein Rückgabewert; signalisiert den Importauftrag an den Rust-Worker.
+    callback import_bandmap_requested();
+    // Zweck: Fordert die Auswahl einer `.bandmap`-Datei mit anschließendem Import an.
+    // Eingaben: Keine Callback-Argumente; der Dateipfad kommt aus dem plattformspezifischen Dialog.
+    // Ausgabe: Kein Rückgabewert; signalisiert Auswahl und Import an den Rust-Backend-Worker.
+    callback select_bandmap_requested();
+
+    VerticalLayout {
+        spacing: 0px;
+        Rectangle {
+            height: 66px;
+            background: #0d1019;
+            HorizontalLayout {
+                padding-left: 24px;
+                padding-right: 24px;
+                spacing: 14px;
+                Text { text: "DBZS"; color: #aa85ff; font-size: 27px; font-weight: 700; }
+                Text { text: "LIVE TABULATOR"; color: #eef0fa; font-size: 17px; font-weight: 600; }
+                Text { text: "RUST CORE  ·  SLINT  ·  LOKALE INFERENZ"; color: #858aa1; font-size: 11px; }
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+                Button {
+                    text: root.show_about ? "Schließen" : "Über";
+                    // Zweck: Öffnet oder schließt das Infofeld.
+                    // Eingaben: Das Slint-Klickereignis.
+                    // Ausgabe: Kein Rückgabewert; schaltet die Eigenschaft `show_about` um.
+                    clicked => { root.show_about = !root.show_about; }
+                }
+            }
+        }
+        Rectangle { height: 1px; background: #272a3a; }
+
+        HorizontalLayout {
+            padding: 22px;
+            spacing: 18px;
+
+            VerticalLayout {
+                width: 430px;
+                spacing: 14px;
+
+                Rectangle {
+                    background: #111522;
+                    border-color: #292d42;
+                    border-width: 1px;
+                    border-radius: 12px;
+                    VerticalLayout {
+                        padding: 18px;
+                        spacing: 10px;
+                        Text { text: "MODELL-REGISTRY"; color: #b49aff; font-size: 12px; font-weight: 700; }
+                        Text {
+                            text: "Festes Standardmodell: Qwen3.5-4B Q4_K_M. App- und weitere Modellwurzeln werden geprüft; andere GGUFs sind kein Assistant-Ersatz.";
+                            color: #c5c8d6;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+                        Button {
+                            text: root.scanning ? "Suche läuft …" : "Modelle scannen";
+                            enabled: !root.busy && !root.scanning;
+                            // Zweck: Löst über den Scan-Button den Registry-Scan aus.
+                            // Eingaben: Das Slint-Klickereignis.
+                            // Ausgabe: Kein Rückgabewert; ruft `scan_requested` auf.
+                            clicked => { root.scan_requested(); }
+                        }
+                        Text {
+                            text: root.status_text;
+                            color: #e0e3ef;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: root.model_list_text;
+                            color: #aeb4c8;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                            vertical-stretch: 1;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 116px;
+                    background: #111522;
+                    border-color: #292d42;
+                    border-width: 1px;
+                    border-radius: 12px;
+                    VerticalLayout {
+                        padding: 16px;
+                        spacing: 8px;
+                        Text { text: "ANALYSE-CORE"; color: #b49aff; font-size: 12px; font-weight: 700; }
+                        Text { text: "Akkord-Templates und Tonartprofil sind im Rust-Core eingebaut; sie benötigen keine LLM-Inferenz."; color: #c5c8d6; font-size: 12px; wrap: word-wrap; }
+                        Text { text: "Hardware- und Echtzeitmetriken werden erst angezeigt, wenn sie am Gerät tatsächlich gemessen werden."; color: #858aa1; font-size: 11px; wrap: word-wrap; }
+                    }
+                }
+
+                Rectangle {
+                    height: 208px;
+                    background: #111522;
+                    border-color: #292d42;
+                    border-width: 1px;
+                    border-radius: 12px;
+                    VerticalLayout {
+                        padding: 16px;
+                        spacing: 8px;
+                        Text { text: "BANDMAP-PROJEKT"; color: #b49aff; font-size: 12px; font-weight: 700; }
+                        Text { text: "V1/V2-Recovery und V3-Portable-Container importieren und lokal sichern."; color: #c5c8d6; font-size: 12px; wrap: word-wrap; }
+                        LineEdit {
+                            text <=> root.bandmap_path_text;
+                            enabled: !root.project_busy;
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button {
+                                text: root.bandmap_file_picker_available ? "Datei wählen & importieren" : "Dateiauswahl nur unter Windows";
+                                enabled: root.bandmap_file_picker_available && !root.project_busy;
+                                // Zweck: Öffnet den nativen Dateidialog und übergibt die Auswahl an den Prüf-/Importablauf.
+                                // Eingaben: Das Slint-Klickereignis; der Dialogfilter bietet `.bandmap`-Dateien an.
+                                // Ausgabe: Kein Rückgabewert; ruft `select_bandmap_requested` auf.
+                                clicked => { root.select_bandmap_requested(); }
+                            }
+                            Button {
+                                text: root.project_busy ? "Import läuft …" : "Pfad importieren";
+                                enabled: !root.project_busy;
+                                // Zweck: Startet den nicht-blockierenden Import des eingetragenen BANDMAP-Pfads.
+                                // Eingaben: Das Slint-Klickereignis; der Pfad ist an `bandmap_path_text` gebunden.
+                                // Ausgabe: Kein Rückgabewert; ruft den Rust-Importcallback auf.
+                                clicked => { root.import_bandmap_requested(); }
+                            }
+                        }
+                        Text {
+                            text: root.project_status_text;
+                            color: #d6d9e6;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 14px;
+
+                Rectangle {
+                    background: #111522;
+                    border-color: #292d42;
+                    border-width: 1px;
+                    border-radius: 12px;
+                    VerticalLayout {
+                        padding: 18px;
+                        spacing: 12px;
+                        Text { text: "LOKALE LLAMA.CPP-RUNTIME"; color: #b49aff; font-size: 12px; font-weight: 700; }
+                        Text {
+                            text: root.runtime_status_text;
+                            color: root.runtime_loaded ? #83d9ac : #d6d9e6;
+                            font-size: 13px;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Button {
+                                text: "Runtime laden";
+                                enabled: root.model_found && !root.busy && !root.runtime_loaded;
+                                // Zweck: Löst über den Lade-Button das Laden des ausgewählten Modells aus.
+                                // Eingaben: Das Slint-Klickereignis.
+                                // Ausgabe: Kein Rückgabewert; ruft `load_model_requested` auf.
+                                clicked => { root.load_model_requested(); }
+                            }
+                            Button {
+                                text: root.busy ? "Läuft …" : "Prompt lokal ausführen";
+                                enabled: root.runtime_loaded && !root.busy;
+                                // Zweck: Löst über den Prompt-Button eine lokale Inferenz aus.
+                                // Eingaben: Das Slint-Klickereignis; der Prompt wird über `prompt_text` gelesen.
+                                // Ausgabe: Kein Rückgabewert; ruft `generate_requested` auf.
+                                clicked => { root.generate_requested(); }
+                            }
+                        }
+                        Text { text: "PROMPT"; color: #9298ae; font-size: 11px; }
+                        LineEdit {
+                            text <=> root.prompt_text;
+                            enabled: root.runtime_loaded && !root.busy;
+                        }
+                        Text { text: "AUSGABE"; color: #9298ae; font-size: 11px; }
+                        Rectangle {
+                            vertical-stretch: 1;
+                            background: #0b0e16;
+                            border-color: #24283a;
+                            border-width: 1px;
+                            border-radius: 8px;
+                            Text {
+                                x: 12px;
+                                y: 10px;
+                                width: parent.width - 24px;
+                                height: parent.height - 20px;
+                                text: root.output_text;
+                                color: #e2e5ef;
+                                font-size: 13px;
+                                wrap: word-wrap;
+                                vertical-alignment: top;
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    text: "CPU-only-Prototyp · keine Cloud-Inferenz · Standardmodell: Qwen3.5-4B Q4_K_M · Laufzeit und Modellspeicher sind getrennte Komponenten.";
+                    color: #7e849a;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+
+    if root.show_about: Rectangle {
+        x: root.width - 380px;
+        y: 74px;
+        width: 350px;
+        height: 190px;
+        background: #151a29;
+        border-color: #4d4070;
+        border-width: 1px;
+        border-radius: 12px;
+        VerticalLayout {
+            padding: 16px;
+            spacing: 10px;
+            Text { text: "ÜBER DBZS LIVETABULATOR"; color: #c5adff; font-size: 13px; font-weight: 700; }
+            Text { text: "Lokale, plattformübergreifend geplante Musikanalyse. Modellinferenz bleibt auf dem Gerät."; color: #d3d6e2; font-size: 12px; wrap: word-wrap; }
+            AboutSlint { }
+        }
+    }
+}

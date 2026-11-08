@@ -10,3 +10,17 @@ __pycache__/
 build/
 dist/
 .DS_Store
+
+# Rust build output
+/target/
+
+# Task-local working files and native build caches
+.work/
+
+# Große lokale Modellgewichte liegen im App-Ordner, werden aber nicht in Git eingecheckt.
+/crates/livetab-app/models/**/*.gguf
+/crates/livetab-app/models/**/*.pte
+/crates/livetab-app/models/**/*.onnx
+/crates/livetab-app/models/**/*.pt
+/crates/livetab-app/models/**/*.pth
+/crates/livetab-app/models/**/*.th
