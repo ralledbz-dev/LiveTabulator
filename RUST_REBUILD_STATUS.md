@@ -38,7 +38,9 @@ Die ursprünglichen Projektpapiere und das UI-Konzept bleiben unverändert erhal
 - [ ] VRAM automatisch ermitteln und GPU-Layerlast daran ausrichten; derzeit bleibt der CUDA-Standard vorsichtig bei 8 Layern, Messprofile werden explizit über `LIVETAB_GPU_LAYERS` gesetzt.
 - [ ] Releasepaket mit passender Runtime-/CUDA-DLL-Auswahl und SHA-256-Prüfung für das Modell erzeugen.
 - [ ] Android-/iOS-Builds auf geeigneter Toolchain und echten Zielgeräten prüfen.
-- [ ] WASAPI-Liveaufnahme, vollständige Audioanalyse-/Playback-Pipeline und Control Desk implementieren; Audio-Latenz ist noch nicht gemessen.
+- [x] Windows-WASAPI-Loopback-Capture, lokaler Live-DSP sowie automatische lokale Rust-DSP-Analyse und Vier-Stem-Trennung gespeicherter Liveaufnahmen; fehlende Stem-Modelle erfordern eine ausdrückliche Downloadfreigabe.
+- [ ] Live-Pitch-/Beat-Ausbau und Control Desk implementieren; echte WASAPI-Geräte-/GUI-Laufzeit und Audio-Latenz sind noch nicht gemessen.
+- [ ] ASIO-Backend für kompatible Windows-Audiointerfaces ergänzen; getrennt vom WASAPI-Systemloopback planen und vor SDK-Integration Lizenz-/Verteilungsweg klären.
 
 ## Quellen
 
@@ -116,4 +118,19 @@ Frühere Windows-Ergebnisse auf RAZOR; Cargo-Abhängigkeiten wurden offline und 
 - `cargo test --locked --workspace`: **bestanden** — App: 12 bestanden, 0 fehlgeschlagen, 3 ignoriert; Core: 58 bestanden, 0 fehlgeschlagen. Die ignorierten Tests erfordern entweder `LIVETAB_TEST_GGUF` oder das lokale Qwen3.5-4B-Modellasset. `cargo fmt --all -- --check` und `git diff --check` bestanden.
 - Python-Worker: `python3 -m unittest -v crates/livetab-core/workers/test_stem_worker.py` — **6 bestanden**; `py_compile` für Worker und Tests bestanden.
 - Im echten Audiopfad ungeprüft: Python-Fork im verwendeten App-Python installieren, Separatorgewichte beziehen, echte Stem-Trennung ausführen und native Geräte-/GUI-Laufzeit prüfen. In dieser Umsetzung wurden **keine** Modellgewichte heruntergeladen; der Code fragt erst beim Lauf fehlender Modellressourcen nach und lädt nur nach ausdrücklicher Slint-Bestätigung.
-- Dieser Linux-Build bestätigt nicht Windows-`wasapi`, Android oder iOS. Systemaudio-Loopback, Echtzeitlatenz und Gerätesupport bleiben außerhalb dieses Slices offen.
+- Dieser Linux-Build des Stem-Slices bestätigte nicht Windows-`wasapi`, Android oder iOS. Der Windows-Systemaudio-Code ist inzwischen im folgenden Abschnitt ergänzt; echte Geräte-/GUI-Laufzeit und Latenz sind weiterhin offen.
+
+
+## Windows-Systemaudio speichern und automatisch analysieren — Stand 2026-11-13
+
+- Der vorhandene Windows-Capture nutzt WASAPI-Loopback am ausgewählten Render-Endpunkt und analysiert Liveframes parallel auf einem separaten DSP-Worker. Das erfasst den Systemmix des Ausgabeendpunkts, keine einzelne YouTube-App oder einen Browser-Tab.
+- Die gepinnte `wasapi`-0.26.0-Quellversion wurde geprüft: Render-Endpunkt plus Shared-Capture-Richtung setzt `AUDCLNT_STREAMFLAGS_LOOPBACK`. Das verifiziert die API-Verdrahtung, nicht die tatsächliche Windows-Gerätelaufzeit.
+- Neu verkettet: Beim Sichern der bis zu zehn Minuten langen Liveaufnahme wird eine lokale Mono-PCM-WAV geschrieben und danach automatisch die vorhandene vollständige Rust-DSP-Offlineanalyse gestartet. Ergebnisse für Akkorde, Noten, Tonart, Beatgrid und Dauer werden in das aktive Projekt übernommen. Der Job lässt sich abbrechen; die WAV bleibt bei einem Analysefehler nach erfolgreichem Schreiben erhalten.
+- Nach terminalem DSP-Auftrag wird für eine tatsächlich gespeicherte WAV ein separater `StemSeparation`-Job gestartet. Er fragt den bestehenden Python-Worker zunächst ohne Downloadfreigabe ab; bei fehlenden Modellressourcen zeigt die UI den vorhandenen expliziten Bestätigungsdialog. Eine Ablehnung erhält WAV und DSP-Ergebnis, lädt nichts herunter und ersetzt keine vorhandenen Stem-Spuren. Ein ausdrücklicher Abbruch der Aufnahme-Nachanalyse unterdrückt den Folgejob.
+- Der App-Puffer wird nach dem WAV-Schreiben vor der erneuten WAV-Dekodierung freigegeben. Setup des Stem-Folgejobs läuft außerhalb des UI-Threads. Auf Nicht-Windows-Builds wird keine Windows-Systemaudio-Automatik behauptet.
+- Projekt-/Quellwechsel und weitere Aufnahme-/Analyseaktionen sind während dieses Auftrags gesperrt, damit der Folgeworker garantiert die neu gespeicherte Aufnahme und nicht einen inzwischen geänderten Projektpfad erhält.
+- `cargo test --locked --workspace`: **bestanden** — App 16 bestanden, 0 fehlgeschlagen, 3 bewusst ignoriert; Core 58 bestanden, 0 fehlgeschlagen. Die beiden zusätzlichen App-Tests prüfen einmaligen Folgejobstart nach terminaler Analyse und Unterdrückung nach Abbruch; bestehende Aufnahmetests sichern WAV-/DSP-Pfad und Abbruch vor dem Schreiben.
+- `cargo check --locked -p livetab-app`: **bestanden** im Linux-Sandboxbuild. `cargo fmt --all -- --check` und `git diff --check`: **bestanden**. Vorhandene plattformabhängige Import-/Dead-code-Warnungen in Capture/Playback bleiben.
+- `python3 -m unittest -v crates/livetab-core/workers/test_stem_worker.py`: **6 bestanden**; `py_compile` für Worker und Tests bestanden. Diese Tests prüfen das Freigabegate und das Vier-Stem-Mapping isoliert, nicht die tatsächliche Modellausführung in der App.
+- **Nicht verifiziert:** echte WASAPI-Geräteaufnahme und Windows-GUI-Laufzeit, YouTube-/Systemton über ein reales Ausgabegerät, Capturelatenz, Audioqualität und tatsächliche Modellgewichte-/Stem-Ausführung im App-Python. Der Linux-Build kompiliert nicht den Windows-`wasapi`-Zweig. Android/iOS bleiben Mikrofonaufnahme statt Systemloopback; Linux-Desktop meldet den fehlenden lokalen Captureadapter.
+- Umsetzungsplan: `IMPLEMENTIERUNGSPLAN_2_SYSTEMAUDIO.md`. Kein Commit erstellt und nichts gepusht.

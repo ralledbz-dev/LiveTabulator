@@ -64,6 +64,7 @@ export component MainWindow inherits Window {
     in-out property <bool> recording: false;
     in-out property <bool> deep_running: false;
     in-out property <bool> stem_running: false;
+    in-out property <bool> auto_stem_after_recording_available: false;
     in-out property <bool> stem_download_prompt_open: false;
     in-out property <bool> stem_vocals_available: false;
     in-out property <bool> stem_drums_available: false;
@@ -98,9 +99,9 @@ export component MainWindow inherits Window {
     // Eingaben: `device_name` – angezeigter aktiver Endpunkt.
     // Ausgabe: Kein Rückgabewert; die Quelle wird lokal gespeichert und beim nächsten Start geöffnet.
     callback audio_device_selected(string);
-    // Zweck: Startet oder beendet die begrenzte WAV-Aufzeichnung der aktiven lokalen Livequelle.
+    // Zweck: Beginnt oder beendet die begrenzte WAV-Aufzeichnung; Windows startet nach dem Speichern automatisch DSP-Analyse und Vier-Stem-Trennung.
     // Eingaben: Keine; beim Beenden wird ein lokales WAV-Ziel ausgewählt.
-    // Ausgabe: Kein Rückgabewert; gespeicherte PCM-Samples werden im Hintergrund geschrieben.
+    // Ausgabe: Kein Rückgabewert; WAV-Speicherung, Offline-DSP und Windows-Stem-Worker laufen abbrechbar im Hintergrund.
     callback toggle_recording_requested();
     // Zweck: Fordert das kontrollierte Beenden der Live-Aufnahme an.
     // Eingaben: Keine.
@@ -361,14 +362,15 @@ export component MainWindow inherits Window {
                                 // Ausgabe: Kein Rückgabewert; stoppt den Capture-Service.
                                 clicked => { root.stop_live_requested(); }
                             }
-                            Button {
-                                text: root.recording ? "WAV sichern" : "WAV aufnehmen";
-                                enabled: root.live_running;
-                                // Zweck: Beginnt die Live-WAV-Pufferung oder öffnet beim Stoppen den Speichern-Dialog.
-                                // Eingaben: Mausklick; Aufnahme endet spätestens nach zehn Minuten.
-                                // Ausgabe: Kein Rückgabewert; Writer speichert eine lokale Mono-PCM-WAV.
-                                clicked => { root.toggle_recording_requested(); }
-                            }
+                        }
+                        Button {
+                            horizontal-stretch: 1;
+                            text: root.recording ? (root.auto_stem_after_recording_available ? "WAV sichern · DSP + Stems" : "WAV sichern & analysieren") : "WAV aufnehmen";
+                            enabled: root.live_running && (!root.busy || root.recording);
+                            // Zweck: Beginnt die Live-WAV-Pufferung oder öffnet beim Stoppen den Speichern-Dialog.
+                            // Eingaben: Mausklick; Aufnahme endet spätestens nach zehn Minuten.
+                            // Ausgabe: Kein Rückgabewert; die Mono-PCM-WAV erhält danach DSP-Analyse und auf Windows zusätzlich die lokale Vier-Stem-Trennung.
+                            clicked => { root.toggle_recording_requested(); }
                         }
                         Button {
                             text: root.deep_running ? "Deep-Analyse läuft …" : "Deep-Analyse starten";
@@ -823,9 +825,9 @@ export component MainWindow inherits Window {
                         }
                         Button {
                             text: "Nicht herunterladen";
-                            // Zweck: Schließt den Dialog ohne Modell- oder Projektänderung.
+                            // Zweck: Schließt den Dialog ohne Modelldownload oder Änderung vorhandener Stem-Spuren.
                             // Eingaben: Mausklick.
-                            // Ausgabe: Kein Rückgabewert; der lokale Modellbestand bleibt unverändert.
+                            // Ausgabe: Kein Rückgabewert; WAV und DSP-Ergebnis bleiben erhalten, Modellbestand und bisherige Stem-Spuren bleiben unverändert.
                             clicked => { root.stem_download_prompt_open = false; root.decline_stem_model_download_requested(); }
                         }
                     }
