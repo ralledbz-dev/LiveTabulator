@@ -52,7 +52,9 @@ ASIO ist als eigene Windows-Quelle neben WASAPI integriert. Der Quellwähler mar
 
 Diese Umsetzung bindet weder das Steinberg-ASIO-SDK noch `asio-sys` ein. Damit wird für den neuen ASIO-Pfad keine GPLv3-SDK-Integration in das MIT-Projekt vorgenommen; Steinbergs separate proprietäre SDK-Lizenz wird ebenfalls nicht benutzt. Die Aufnahme eines echten Treibers/Geräts und die gerätespezifischen Treiberbedingungen bleiben dennoch gesondert zu prüfen.
 
-**Verifikation:** `asio_capture.rs` und `audio_capture.rs` bestanden gemeinsam einen isolierten `x86_64-pc-windows-gnu`-Zielcompile mit `azo`, `crossbeam-channel`, `cpal`, `wasapi` und dem Rust-Core; `--tests` typprüfte außerdem den ASIO-Testcode, führte ihn aber nicht aus. Der vollständige App-Windows-Compile konnte wegen des vorhandenen `llama-cpp-sys-4`-Buildscripts nicht bis zur App gelangen: Clang findet `stdbool.h` in der Sandbox-MinGW-Zielkonfiguration nicht. Linux-Appbuild und Workspace-Tests bestanden; Linux allein kompiliert den Windows-Zweig nicht. **Nicht geprüft:** ASIO-Laufzeit mit echtem Treiber/Interface, Windows-GUI, tatsächliche Latenz oder Audioqualität.
+**Spätere Crossbuild-Verifikation:** `cargo check --locked --target x86_64-pc-windows-gnu -p livetab-app` und `cargo build --locked --target x86_64-pc-windows-gnu -p livetab-app` bestanden im Linux-Sandbox-Crossbuild; der vollständige Windows-Appcode und die nativen llama.cpp-Bibliotheken wurden gebaut. Der anfängliche `stdbool.h`-Fehler wurde mit expliziten Bindgen-Targetheadern behoben; zusätzliche MinGW-Header- und statische Link-Suchpfade erforderten temporäre Sandbox-Overrides. Diese Overrides sind keine portable Projekt-Buildkonfiguration. Das daraus erzeugte Windows-x64-Testpaket (`.work/windows-asio-test-x64-gnu.zip`) und die genauen Toolchain-Entscheidungen sind in `WINDOWS_CROSS_BUILD_STATUS.md` dokumentiert.
+
+**Nicht geprüft:** ASIO-Laufzeit mit echtem Treiber/Interface, Windows-GUI, tatsächliche Latenz oder Audioqualität. Für den Hardwaretest ist ein Windows-PC mit installiertem ASIO-Treiber erforderlich.
 
 ## Technische Referenzen
 
