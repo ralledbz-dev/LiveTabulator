@@ -2,6 +2,7 @@ mod app_workflows;
 mod audio_capture;
 mod llama_runtime;
 mod playback_output;
+mod stem_workflow;
 
 use crate::llama_runtime::LoadedModel;
 use livetab_core::AppController;

@@ -2947,6 +2947,8 @@ dependencies = [
  "livetab-core",
  "llama-cpp-4",
  "rfd",
+ "serde",
+ "serde_json",
  "slint",
  "slint-build",
  "wasapi",

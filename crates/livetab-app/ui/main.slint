@@ -40,6 +40,10 @@ export component MainWindow inherits Window {
     in-out property <string> fretboard_text: "EADGBE · Standardstimmung";
     in-out property <string> scales_text: "Skalenempfehlungen erscheinen nach der Tonart-Erkennung.";
     in-out property <string> tracks_text: "Original  0 dB\nDrums     0 dB\nBass      0 dB\nOther     0 dB\nVocals    0 dB\nGitarre   0 dB\nMetronom  0 dB";
+    in-out property <string> stem_status_text: "Vier-Stem-Trennung ist bereit; benötigt eine lokale WAV-Datei.";
+    in-out property <string> stem_download_prompt_text: "";
+    in-out property <string> active_audio_source_id: "source";
+    in-out property <string> active_audio_source_label: "Original";
     in-out property <string> observer_text: "Observer wartet auf Ereignisse.";
     in-out property <string> project_status_text: "Noch kein Projekt geöffnet.";
     in-out property <string> project_path_text: "";
@@ -59,6 +63,12 @@ export component MainWindow inherits Window {
     in-out property <bool> live_running: false;
     in-out property <bool> recording: false;
     in-out property <bool> deep_running: false;
+    in-out property <bool> stem_running: false;
+    in-out property <bool> stem_download_prompt_open: false;
+    in-out property <bool> stem_vocals_available: false;
+    in-out property <bool> stem_drums_available: false;
+    in-out property <bool> stem_bass_available: false;
+    in-out property <bool> stem_other_available: false;
     in-out property <bool> playback_running: false;
     in-out property <bool> playback_paused: false;
     in-out property <bool> busy: false;
@@ -104,6 +114,26 @@ export component MainWindow inherits Window {
     // Eingaben: Keine.
     // Ausgabe: Kein Rückgabewert; signalisiert dem JobManager den Abbruchwunsch.
     callback cancel_deep_analysis_requested();
+    // Zweck: Startet die lokale Vier-Stem-Trennung des geöffneten WAVs.
+    // Eingaben: Keine; Modell und Audioquelle stammen aus dem lokalen Projektzustand.
+    // Ausgabe: Kein Rückgabewert; fehlende Modellressourcen führen zunächst zu einem Bestätigungsdialog.
+    callback run_stem_separation_requested();
+    // Zweck: Bestätigt genau den zuvor angezeigten lokalen Separator-Modell-Download.
+    // Eingaben: Keine; Zustimmung gilt nur für das angezeigte htdemucs-Modell und diesen Job.
+    // Ausgabe: Kein Rückgabewert; startet den Worker mit explizit erlaubtem Modellabruf.
+    callback confirm_stem_model_download_requested();
+    // Zweck: Lehnt den angezeigten Modellabruf ab oder schließt den Bestätigungsdialog.
+    // Eingaben: Keine.
+    // Ausgabe: Kein Rückgabewert; Modellbestand und Projekt bleiben unverändert.
+    callback decline_stem_model_download_requested();
+    // Zweck: Bricht den aktiven Separator-Unterprozess ab.
+    // Eingaben: Keine.
+    // Ausgabe: Kein Rückgabewert; der JobManager beendet den lokalen Prozess.
+    callback cancel_stem_separation_requested();
+    // Zweck: Wählt Original oder eine bereits geladene Stem-Spur zum Solo-Abhören.
+    // Eingaben: Stabile Quellen-ID (`source`, `stem-vocals`, `stem-drums`, `stem-bass`, `stem-other`).
+    // Ausgabe: Kein Rückgabewert; die aktive WAV wechselt bei laufendem Playback ohne Cursorreset.
+    callback select_audio_source_requested(string);
     // Zweck: Startet oder pausiert den musikalisch synchronisierten Playback-Scheduler.
     // Eingaben: Keine; Song, Tempo, Loop und Spurzustand stammen aus dem Projektmodell.
     // Ausgabe: Kein Rückgabewert; delegiert den Wiedergabebefehl an den Controller.
@@ -273,7 +303,7 @@ export component MainWindow inherits Window {
                 }
 
                 Rectangle {
-                    height: 300px;
+                    height: 350px;
                     background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
                     VerticalLayout {
                         padding: 13px; spacing: 7px;
@@ -355,6 +385,22 @@ export component MainWindow inherits Window {
                             // Ausgabe: Kein Rückgabewert; der Worker prüft die Anforderung zwischen Frames.
                             clicked => { root.cancel_deep_analysis_requested(); }
                         }
+                        Button {
+                            text: root.stem_running ? "Stems werden getrennt …" : "Vier Stems trennen";
+                            enabled: !root.stem_running && !root.busy && !root.deep_running;
+                            // Zweck: Startet eine lokale Vier-Stem-Trennung oder zeigt vorher die Modellfreigabe.
+                            // Eingaben: Mausklick; Quellpfad stammt aus dem geöffneten Songprojekt.
+                            // Ausgabe: Kein Rückgabewert; Ergebnisse werden als vier synchronisierte WAVs übernommen.
+                            clicked => { root.run_stem_separation_requested(); }
+                        }
+                        if root.stem_running: Button {
+                            text: "Stem-Trennung abbrechen";
+                            // Zweck: Stoppt den lokalen Python-Separator-Prozess.
+                            // Eingaben: Mausklick.
+                            // Ausgabe: Kein Rückgabewert; der Rust-Job beendet den Unterprozess.
+                            clicked => { root.cancel_stem_separation_requested(); }
+                        }
+                        Text { text: root.stem_status_text; color: #aeb4c8; font-size: 9px; wrap: word-wrap; }
                     }
                 }
 
@@ -577,13 +623,54 @@ export component MainWindow inherits Window {
                 }
 
                 Rectangle {
-                    height: 202px;
+                    height: 238px;
                     background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
                     VerticalLayout {
                         padding: 13px; spacing: 6px;
                         Text { text: "SPUREN & MIXER"; color: #b49aff; font-size: 10px; font-weight: 700; }
                         Text { text: root.tracks_text; color: #c5c8d6; font-size: 10px; font-family: "Consolas"; wrap: word-wrap; vertical-stretch: 1; }
-                        Text { text: "Spuren- und Lautstärkestatus"; color: #858aa1; font-size: 9px; }
+                        HorizontalLayout {
+                            spacing: 4px;
+                            Button {
+                                text: "Original";
+                                // Zweck: Schaltet den lokalen Solo-Ausgang auf die unveränderte Quelle.
+                                // Eingaben: Mausklick.
+                                // Ausgabe: Kein Rückgabewert; gemeinsamer Playhead bleibt erhalten.
+                                clicked => { root.select_audio_source_requested("source"); }
+                            }
+                            Button {
+                                text: "Gesang"; enabled: root.stem_vocals_available;
+                                // Zweck: Schaltet den lokalen Solo-Ausgang auf die Gesangsspur.
+                                // Eingaben: Mausklick.
+                                // Ausgabe: Kein Rückgabewert; gemeinsamer Playhead bleibt erhalten.
+                                clicked => { root.select_audio_source_requested("stem-vocals"); }
+                            }
+                            Button {
+                                text: "Drums"; enabled: root.stem_drums_available;
+                                // Zweck: Schaltet den lokalen Solo-Ausgang auf die Schlagzeugspur.
+                                // Eingaben: Mausklick.
+                                // Ausgabe: Kein Rückgabewert; gemeinsamer Playhead bleibt erhalten.
+                                clicked => { root.select_audio_source_requested("stem-drums"); }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 4px;
+                            Button {
+                                text: "Bass"; enabled: root.stem_bass_available;
+                                // Zweck: Schaltet den lokalen Solo-Ausgang auf die Bassspur.
+                                // Eingaben: Mausklick.
+                                // Ausgabe: Kein Rückgabewert; gemeinsamer Playhead bleibt erhalten.
+                                clicked => { root.select_audio_source_requested("stem-bass"); }
+                            }
+                            Button {
+                                text: "Übrige"; enabled: root.stem_other_available;
+                                // Zweck: Schaltet den lokalen Solo-Ausgang auf die übrige Instrumentalspur.
+                                // Eingaben: Mausklick.
+                                // Ausgabe: Kein Rückgabewert; gemeinsamer Playhead bleibt erhalten.
+                                clicked => { root.select_audio_source_requested("stem-other"); }
+                            }
+                            Text { text: "Aktiv: " + root.active_audio_source_label; color: #858aa1; font-size: 9px; vertical-alignment: center; }
+                        }
                     }
                 }
 
@@ -708,6 +795,41 @@ export component MainWindow inherits Window {
                     Text { text: "Keine ungemessenen Hardwarewerte"; color: #858aa1; font-size: 9px; }
                 }
                 Text { text: root.observer_text; color: #aeb4c8; font-size: 9px; font-family: "Consolas"; wrap: word-wrap; vertical-stretch: 1; vertical-alignment: top; }
+            }
+        }
+    }
+
+    if root.stem_download_prompt_open: Rectangle {
+        x: 0px; y: 0px; width: root.width; height: root.height;
+        background: #080a11;
+        border-color: #4d4070; border-width: 1px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 580px; height: 330px;
+                background: #151a29; border-color: #8067b9; border-width: 1px; border-radius: 12px;
+                VerticalLayout {
+                    padding: 18px; spacing: 12px;
+                    Text { text: "MODELLDOWNLOAD BESTÄTIGEN"; color: #c5adff; font-size: 13px; font-weight: 700; }
+                    Text { text: root.stem_download_prompt_text; color: #d3d6e2; font-size: 10px; wrap: word-wrap; vertical-stretch: 1; vertical-alignment: top; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Button {
+                            text: "Herunterladen und fortfahren";
+                            // Zweck: Erlaubt die im Dialog beschriebenen fehlenden Modelldateien.
+                            // Eingaben: Mausklick als ausdrückliche Nutzerbestätigung.
+                            // Ausgabe: Kein Rückgabewert; startet denselben Job mit Downloadfreigabe.
+                            clicked => { root.stem_download_prompt_open = false; root.confirm_stem_model_download_requested(); }
+                        }
+                        Button {
+                            text: "Nicht herunterladen";
+                            // Zweck: Schließt den Dialog ohne Modell- oder Projektänderung.
+                            // Eingaben: Mausklick.
+                            // Ausgabe: Kein Rückgabewert; der lokale Modellbestand bleibt unverändert.
+                            clicked => { root.stem_download_prompt_open = false; root.decline_stem_model_download_requested(); }
+                        }
+                    }
+                }
             }
         }
     }

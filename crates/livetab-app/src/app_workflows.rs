@@ -13,6 +13,7 @@ Hinweise:
 */
 use crate::audio_capture::{self, CaptureSession};
 use crate::playback_output::PlaybackOutputSession;
+use crate::stem_workflow::{self, StemRunContext};
 use crate::{MainWindow, ModelCatalog, application_data_directory};
 use livetab_core::audio::{read_wav, write_wav};
 use livetab_core::event_bus::AppEvent;
@@ -20,7 +21,7 @@ use livetab_core::export::load_dbztab;
 use livetab_core::jobs::{JobEvent, JobHandle, JobKind, JobState};
 use livetab_core::lyrics::PythonWorkerLyricsBackend;
 use livetab_core::model_registry::{ModelRole, ModelStatus};
-use livetab_core::project_model::GuitarTuning;
+use livetab_core::project_model::{GuitarTuning, StemKind};
 use livetab_core::tab_engine::{describe_tuning, format_ascii_tab};
 use livetab_core::{AppController, SongProject};
 #[cfg(windows)]
@@ -32,12 +33,16 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// Obergrenze für den gemeinsamen WAV-Dateibestand bei Original plus synchronisierten Stems.
+const MAX_SYNC_PLAYBACK_FILE_BYTES: u64 = 384 * 1024 * 1024;
+
 /// Besitz der langlaufenden Workerflags, die nach dem Schließen kontrolliert gestoppt werden.
 pub struct AppLifecycle {
     shutdown: Arc<AtomicBool>,
     capture_requested: Arc<AtomicBool>,
     capture: Arc<Mutex<Option<CaptureSession>>>,
     playback: Arc<Mutex<Option<PlaybackOutputSession>>>,
+    stem_job: Arc<Mutex<Option<JobHandle>>>,
 }
 
 impl AppLifecycle {
@@ -47,6 +52,11 @@ impl AppLifecycle {
     pub fn stop(self) {
         self.shutdown.store(true, Ordering::Release);
         self.capture_requested.store(false, Ordering::Release);
+        if let Ok(mut active) = self.stem_job.lock() {
+            if let Some(job) = active.take() {
+                job.cancellation.cancel();
+            }
+        }
         if let Ok(mut capture) = self.capture.lock() {
             if let Some(session) = capture.take() {
                 thread::spawn(move || session.stop());
@@ -69,6 +79,9 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
     let capture = Arc::new(Mutex::new(None));
     let playback: Arc<Mutex<Option<PlaybackOutputSession>>> = Arc::new(Mutex::new(None));
     let deep_job: Arc<Mutex<Option<JobHandle>>> = Arc::new(Mutex::new(None));
+    let stem_job: Arc<Mutex<Option<JobHandle>>> = Arc::new(Mutex::new(None));
+    let pending_stem_download: Arc<Mutex<Option<StemRunContext>>> = Arc::new(Mutex::new(None));
+    let active_audio_source_id = Arc::new(Mutex::new("source".to_string()));
     let playback_clock_started = Arc::new(AtomicBool::new(false));
     start_event_dispatcher(
         ui.as_weak(),
@@ -82,6 +95,8 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
         controller.clone(),
         Arc::clone(&shutdown),
         Arc::clone(&deep_job),
+        Arc::clone(&stem_job),
+        Arc::clone(&pending_stem_download),
     );
 
     {
@@ -343,8 +358,167 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
         let weak = ui.as_weak();
         let controller = controller.clone();
         let playback = Arc::clone(&playback);
+        let active_audio_source_id = Arc::clone(&active_audio_source_id);
         let playback_clock_started = Arc::clone(&playback_clock_started);
         let shutdown = Arc::clone(&shutdown);
+        {
+            let weak = ui.as_weak();
+            let controller = controller.clone();
+            let stem_job = Arc::clone(&stem_job);
+            let pending_stem_download = Arc::clone(&pending_stem_download);
+            ui.on_run_stem_separation_requested(move || {
+                let Some(handle) = weak.upgrade() else { return };
+                if handle.get_busy() || handle.get_stem_running() || handle.get_playback_running() {
+                    return;
+                }
+                let snapshot = match controller.snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        handle.set_stem_status_text(error.into());
+                        return;
+                    }
+                };
+                let context = match stem_workflow::prepare_context(&snapshot) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        handle.set_stem_status_text(error.clone().into());
+                        handle.set_status_text(error.into());
+                        return;
+                    }
+                };
+                handle.set_busy(true);
+                handle.set_stem_running(true);
+                handle.set_stem_status_text("Prüfe lokale Modelldateien ohne Download …".into());
+                let job = stem_workflow::start_job(
+                    controller.clone(),
+                    context,
+                    false,
+                    Arc::clone(&pending_stem_download),
+                );
+                if let Ok(mut active) = stem_job.lock() {
+                    *active = Some(job);
+                }
+            });
+        }
+        {
+            let weak = ui.as_weak();
+            let controller = controller.clone();
+            let stem_job = Arc::clone(&stem_job);
+            let pending_stem_download = Arc::clone(&pending_stem_download);
+            ui.on_confirm_stem_model_download_requested(move || {
+                let Some(handle) = weak.upgrade() else { return };
+                let context = pending_stem_download
+                    .lock()
+                    .ok()
+                    .and_then(|mut pending| pending.take());
+                let Some(context) = context else {
+                    handle.set_stem_status_text(
+                        "Downloadfreigabe ist abgelaufen; bitte Trennung erneut starten.".into(),
+                    );
+                    return;
+                };
+                handle.set_busy(true);
+                handle.set_stem_running(true);
+                handle.set_stem_status_text(
+                    "Modellabruf ausdrücklich freigegeben; lokale Stem-Trennung läuft …".into(),
+                );
+                let job = stem_workflow::start_job(
+                    controller.clone(),
+                    context,
+                    true,
+                    Arc::clone(&pending_stem_download),
+                );
+                if let Ok(mut active) = stem_job.lock() {
+                    *active = Some(job);
+                }
+            });
+        }
+        {
+            let weak = ui.as_weak();
+            let pending_stem_download = Arc::clone(&pending_stem_download);
+            ui.on_decline_stem_model_download_requested(move || {
+                if let Ok(mut pending) = pending_stem_download.lock() {
+                    *pending = None;
+                }
+                if let Some(handle) = weak.upgrade() {
+                    handle.set_stem_download_prompt_open(false);
+                    handle.set_stem_status_text(
+                        "Modell nicht heruntergeladen; Projekt und Modellbestand unverändert."
+                            .into(),
+                    );
+                    handle.set_status_text(
+                        "Modell-Download abgelehnt; keine Änderungen vorgenommen.".into(),
+                    );
+                }
+            });
+        }
+        {
+            let weak = ui.as_weak();
+            let stem_job = Arc::clone(&stem_job);
+            ui.on_cancel_stem_separation_requested(move || {
+                if let Ok(active) = stem_job.lock() {
+                    if let Some(job) = active.as_ref() {
+                        job.cancellation.cancel();
+                    }
+                }
+                if let Some(handle) = weak.upgrade() {
+                    handle.set_stem_status_text(
+                        "Abbruch angefordert; lokaler Separator-Prozess wird beendet …".into(),
+                    );
+                }
+            });
+        }
+        {
+            let weak = ui.as_weak();
+            let controller = controller.clone();
+            let playback = Arc::clone(&playback);
+            let active_audio_source_id = Arc::clone(&active_audio_source_id);
+            ui.on_select_audio_source_requested(move |source_id| {
+                let Some(handle) = weak.upgrade() else { return };
+                let source_id = source_id.to_string();
+                let project = match controller.snapshot() {
+                    Ok(project) => project,
+                    Err(error) => {
+                        handle.set_status_text(error.into());
+                        return;
+                    }
+                };
+                let available = if source_id == "source" {
+                    project.audio_path.is_some()
+                } else {
+                    project
+                        .stem_tracks
+                        .iter()
+                        .any(|track| format!("stem-{}", stem_kind_key(track.kind)) == source_id)
+                };
+                if !available {
+                    handle.set_status_text(
+                        "Diese lokale Audiospur ist in diesem Projekt nicht vorhanden.".into(),
+                    );
+                    return;
+                }
+                if let Ok(active) = playback.lock() {
+                    if let Some(session) = active.as_ref() {
+                        if let Err(error) = session.select_source(&source_id) {
+                            handle.set_status_text(error.into());
+                            return;
+                        }
+                    }
+                }
+                if let Ok(mut active) = active_audio_source_id.lock() {
+                    *active = source_id.clone();
+                }
+                handle.set_active_audio_source_id(source_id.clone().into());
+                handle.set_active_audio_source_label(audio_source_label(&source_id).into());
+                handle.set_worker_status_text(
+                    format!(
+                        "Solo-Ausgabe: {} · gemeinsamer Playhead",
+                        audio_source_label(&source_id)
+                    )
+                    .into(),
+                );
+            });
+        }
         ui.on_toggle_playback_requested(move || {
             let Some(handle) = weak.upgrade() else { return };
             if handle.get_playback_running() && !handle.get_playback_paused() {
@@ -383,6 +557,7 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
                     weak.clone(),
                     controller.clone(),
                     Arc::clone(&playback),
+                    Arc::clone(&active_audio_source_id),
                     Arc::clone(&shutdown),
                     Arc::clone(&playback_clock_started),
                     tempo,
@@ -749,6 +924,7 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
         capture_requested,
         capture,
         playback,
+        stem_job,
     }
 }
 
@@ -811,6 +987,7 @@ fn start_playback_async(
     weak: Weak<MainWindow>,
     controller: AppController,
     playback: Arc<Mutex<Option<PlaybackOutputSession>>>,
+    active_audio_source_id: Arc<Mutex<String>>,
     shutdown: Arc<AtomicBool>,
     playback_clock_started: Arc<AtomicBool>,
     tempo_percent: i32,
@@ -833,18 +1010,65 @@ fn start_playback_async(
         );
         return;
     };
+    let mut source_paths = vec![("source".to_string(), path)];
+    source_paths.extend(
+        project
+            .stem_tracks
+            .iter()
+            .map(|track| (track.id.clone(), track.file_path.clone())),
+    );
+    let mut selected_source = active_audio_source_id
+        .lock()
+        .map(|source| source.clone())
+        .unwrap_or_else(|_| "source".into());
+    if !source_paths.iter().any(|(id, _)| id == &selected_source) {
+        selected_source = "source".into();
+        if let Ok(mut current) = active_audio_source_id.lock() {
+            *current = selected_source.clone();
+        }
+        handle.set_active_audio_source_id("source".into());
+        handle.set_active_audio_source_label("Original".into());
+    }
     handle.set_busy(true);
-    handle.set_worker_status_text("Lokale WAV-Ausgabe wird geöffnet …".into());
+    handle.set_worker_status_text("Original und synchronisierte Stem-WAVs werden geladen …".into());
     let bpm = project.bpm;
     let meter_numerator = project.time_signature.numerator();
     let project_duration = project.duration_seconds;
     thread::spawn(move || {
-        let result = read_wav(&path)
-            .map_err(|error| error.to_string())
-            .and_then(|wave| {
-                let duration = wave.duration_seconds();
-                PlaybackOutputSession::start(wave).map(|session| (session, duration))
-            });
+        let result = (|| {
+            if source_paths.len() > 1 {
+                let total_bytes = source_paths.iter().try_fold(
+                    0u64,
+                    |total, (_, path)| -> Result<u64, String> {
+                        let file_bytes = std::fs::metadata(path)
+                            .map_err(|error| format!("{}: {error}", path.display()))?
+                            .len();
+                        total.checked_add(file_bytes).ok_or_else(|| {
+                            "Gesamtgröße der Playback-WAVs ist nicht darstellbar.".into()
+                        })
+                    },
+                )?;
+                if total_bytes > MAX_SYNC_PLAYBACK_FILE_BYTES {
+                    return Err(format!(
+                        "Original und Stem-WAVs belegen zusammen mehr als 384 MiB; das synchronisierte Laden ist zum Schutz des Arbeitsspeichers begrenzt."
+                    ));
+                }
+            }
+            let sources = source_paths
+                .into_iter()
+                .map(|(id, path)| {
+                    read_wav(&path)
+                        .map(|wave| (id, wave))
+                        .map_err(|error| format!("{}: {error}", path.display()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let duration = sources
+                .first()
+                .map(|(_, wave)| wave.duration_seconds())
+                .unwrap_or_default();
+            PlaybackOutputSession::start_sources(sources, &selected_source)
+                .map(|session| (session, duration))
+        })();
         let _ = weak.upgrade_in_event_loop(move |handle| {
             handle.set_busy(false);
             match result {
@@ -1076,6 +1300,8 @@ fn start_job_dispatcher(
     controller: AppController,
     shutdown: Arc<AtomicBool>,
     deep_job: Arc<Mutex<Option<JobHandle>>>,
+    stem_job: Arc<Mutex<Option<JobHandle>>>,
+    pending_stem_download: Arc<Mutex<Option<StemRunContext>>>,
 ) {
     let Some(receiver) = controller.job_manager().take_event_receiver() else {
         return;
@@ -1091,6 +1317,8 @@ fn start_job_dispatcher(
                 };
                 let weak = weak.clone();
                 let deep_job = Arc::clone(&deep_job);
+                let stem_job = Arc::clone(&stem_job);
+                let pending_stem_download = Arc::clone(&pending_stem_download);
                 let controller = controller.clone();
                 let _ = weak.clone().upgrade_in_event_loop(move |handle| {
                     let (status, terminal, kind, progress, message) = match event {
@@ -1126,6 +1354,9 @@ fn start_job_dispatcher(
                     if kind == JobKind::DeepAnalysis {
                         handle.set_deep_running(!terminal);
                     }
+                    if kind == JobKind::StemSeparation {
+                        handle.set_stem_running(!terminal);
+                    }
                     handle.set_worker_status_text(
                         format!("{:?} · {:.0}% · {message}", status, progress * 100.0).into(),
                     );
@@ -1135,10 +1366,36 @@ fn start_job_dispatcher(
                                 *active = None;
                             }
                         }
-                        if status == JobState::Succeeded {
+                        if kind == JobKind::StemSeparation {
+                            if let Ok(mut active) = stem_job.lock() {
+                                *active = None;
+                            }
+                            handle.set_busy(false);
+                            if status == JobState::Succeeded && message == "STEM_DOWNLOAD_REQUIRED" {
+                                let prompt = pending_stem_download
+                                    .lock()
+                                    .ok()
+                                    .and_then(|pending| pending.as_ref().and_then(|context| context.download_prompt.clone()));
+                                if let Some(prompt) = prompt {
+                                    handle.set_stem_download_prompt_text(prompt.into());
+                                    handle.set_stem_download_prompt_open(true);
+                                    handle.set_stem_status_text("Modell fehlt; ohne Ihre Bestätigung wird nichts heruntergeladen.".into());
+                                    handle.set_status_text("Für diese lokale Trennung fehlen Modelldateien. Bitte bestätigen oder ablehnen.".into());
+                                } else {
+                                    handle.set_stem_status_text("Worker meldete fehlende Modellressourcen, aber kein Freigabedialog war verfügbar.".into());
+                                }
+                            } else if status == JobState::Succeeded {
+                                handle.set_stem_status_text(message.clone().into());
+                            } else {
+                                handle.set_stem_status_text(format!("Stem-Job {status:?}: {message}").into());
+                            }
+                        }
+                        if status == JobState::Succeeded && !(kind == JobKind::StemSeparation && message == "STEM_DOWNLOAD_REQUIRED") {
                             handle.set_status_text(message.into());
                         } else {
-                            handle.set_status_text(format!("Job beendet: {message}").into());
+                            if kind != JobKind::StemSeparation {
+                                handle.set_status_text(format!("Job beendet: {message}").into());
+                            }
                         }
                         update_project_view(&handle, &controller);
                     }
@@ -1254,7 +1511,63 @@ fn update_project_view(handle: &MainWindow, controller: &AppController) {
     } else {
         "Original  keine Audioquelle"
     };
-    handle.set_tracks_text(format!("{original}\nAkkorde   {}\nNoten     {}\nBeats     {}\nLyrics    {} Wörter\nGitarre   {} Tabnoten\nMetronom  bereit", project.chords.len(), project.notes.len(), project.beats.len(), project.lyrics_words.len(), project.tab_tracks.iter().map(|track| track.notes.len()).sum::<usize>()).into());
+    let mut track_lines = vec![original.to_string()];
+    for track in &project.stem_tracks {
+        track_lines.push(format!(
+            "{}  {:.2}s · {} Hz",
+            track.name, track.duration_seconds, track.sample_rate
+        ));
+    }
+    track_lines.extend([
+        format!("Akkorde   {}", project.chords.len()),
+        format!("Noten     {}", project.notes.len()),
+        format!("Beats     {}", project.beats.len()),
+        format!("Lyrics    {} Wörter", project.lyrics_words.len()),
+        format!(
+            "Gitarre   {} Tabnoten",
+            project
+                .tab_tracks
+                .iter()
+                .map(|track| track.notes.len())
+                .sum::<usize>()
+        ),
+        "Metronom  bereit".into(),
+    ]);
+    handle.set_tracks_text(track_lines.join("\n").into());
+    handle.set_stem_vocals_available(
+        project
+            .stem_tracks
+            .iter()
+            .any(|track| track.kind == StemKind::Vocals),
+    );
+    handle.set_stem_drums_available(
+        project
+            .stem_tracks
+            .iter()
+            .any(|track| track.kind == StemKind::Drums),
+    );
+    handle.set_stem_bass_available(
+        project
+            .stem_tracks
+            .iter()
+            .any(|track| track.kind == StemKind::Bass),
+    );
+    handle.set_stem_other_available(
+        project
+            .stem_tracks
+            .iter()
+            .any(|track| track.kind == StemKind::Other),
+    );
+    let active_source = handle.get_active_audio_source_id().to_string();
+    if active_source != "source"
+        && !project
+            .stem_tracks
+            .iter()
+            .any(|track| format!("stem-{}", stem_kind_key(track.kind)) == active_source)
+    {
+        handle.set_active_audio_source_id("source".into());
+        handle.set_active_audio_source_label("Original".into());
+    }
     handle.set_project_status_text(
         format!(
             "{} · {} · Revision {}",
@@ -1263,6 +1576,32 @@ fn update_project_view(handle: &MainWindow, controller: &AppController) {
         .into(),
     );
     handle.set_observer_text(controller.observer().panel_text().into());
+}
+
+/// Zweck: Erzeugt die stabile ID-Komponente für eine Stem-Klasse.
+/// Eingaben: `kind` – Kernklassifikation der Spur.
+/// Ausgabe: Kleingeschriebener Quellen-ID-Schlüssel für UI und Playback.
+fn stem_kind_key(kind: StemKind) -> &'static str {
+    match kind {
+        StemKind::Vocals => "vocals",
+        StemKind::Drums => "drums",
+        StemKind::Bass => "bass",
+        StemKind::Other => "other",
+    }
+}
+
+/// Zweck: Liefert die kurze deutsche Beschriftung einer ausgewählten Playbackquelle.
+/// Eingaben: `source_id` – `source` oder eine stabile `stem-*`-Kennung.
+/// Ausgabe: Menschenlesbarer Anzeigename; unbekannte IDs bleiben sichtbar.
+fn audio_source_label(source_id: &str) -> &'static str {
+    match source_id {
+        "source" => "Original",
+        "stem-vocals" => "Gesang",
+        "stem-drums" => "Drums",
+        "stem-bass" => "Bass",
+        "stem-other" => "Übrige Instrumente",
+        _ => "Unbekannte Quelle",
+    }
 }
 
 /// Zweck: Startet einen validierten .dbztab-Projektexport außerhalb des UI-Threads.

@@ -105,8 +105,8 @@ pub fn export_project(
     Ok(path.to_path_buf())
 }
 
-/// Zweck: Speichert ein portables `.dbztab`-Archiv aus Projekt-JSON und optionaler Audiodatei.
-/// Eingaben: Valides Songprojekt und Zielpfad; nur eine vorhandene lokale Audioquelle wird eingebettet.
+/// Zweck: Speichert ein portables `.dbztab`-Archiv aus Projekt-JSON, Audioquelle und Stem-WAVs.
+/// Eingaben: Valides Songprojekt und Zielpfad; Medien werden nur aus bestehenden lokalen Dateien eingebettet.
 /// Ausgabe: `Ok(())` nach Abschluss oder ein JSON-/ZIP-/Dateifehler.
 pub fn save_dbztab(project: &SongProject, path: impl AsRef<Path>) -> Result<(), String> {
     project.validate()?;
@@ -128,9 +128,27 @@ pub fn save_dbztab(project: &SongProject, path: impl AsRef<Path>) -> Result<(), 
         .as_ref()
         .filter(|audio| audio.is_file())
         .cloned();
+    let mut embedded_stems = Vec::with_capacity(project.stem_tracks.len());
+    for track in &project.stem_tracks {
+        if !track.file_path.is_file() {
+            return Err(format!(
+                "Stem-WAV für {} fehlt und kann nicht portabel gespeichert werden.",
+                track.name
+            ));
+        }
+        let metadata = fs::metadata(&track.file_path)
+            .map_err(|error| format!("Stem-WAV konnte nicht geprüft werden: {error}"))?;
+        if metadata.len() > MAX_EMBEDDED_AUDIO_BYTES {
+            return Err(format!("Stem-WAV {} überschreitet zwei GiB.", track.name));
+        }
+        embedded_stems.push((track.id.clone(), track.file_path.clone()));
+    }
     portable.audio_path = embedded_audio
         .as_ref()
         .map(|_| PathBuf::from("audio/source.wav"));
+    for track in &mut portable.stem_tracks {
+        track.file_path = PathBuf::from(format!("audio/stems/{}.wav", track.id));
+    }
     archive
         .start_file("project.json", options)
         .map_err(|error| format!("Projektmanifest konnte nicht begonnen werden: {error}"))?;
@@ -150,13 +168,23 @@ pub fn save_dbztab(project: &SongProject, path: impl AsRef<Path>) -> Result<(), 
         std::io::copy(&mut audio, &mut archive)
             .map_err(|error| format!("Audiodatei konnte nicht eingebettet werden: {error}"))?;
     }
+    for (id, stem_path) in embedded_stems {
+        let entry_name = format!("audio/stems/{id}.wav");
+        archive
+            .start_file(&entry_name, options)
+            .map_err(|error| format!("Stem-Eintrag konnte nicht begonnen werden: {error}"))?;
+        let mut stem = File::open(stem_path)
+            .map_err(|error| format!("Stem-WAV konnte nicht geöffnet werden: {error}"))?;
+        std::io::copy(&mut stem, &mut archive)
+            .map_err(|error| format!("Stem-WAV konnte nicht eingebettet werden: {error}"))?;
+    }
     archive
         .finish()
         .map_err(|error| format!("Projektarchiv konnte nicht abgeschlossen werden: {error}"))?;
     Ok(())
 }
 
-/// Zweck: Lädt ein `.dbztab`-Archiv, validiert das Projektmanifest und extrahiert nur den bekannten Audioeintrag.
+/// Zweck: Lädt ein `.dbztab`-Archiv, validiert das Manifest und extrahiert nur kanonische Audio-/Stem-Einträge.
 /// Eingaben: Archivpfad und lokaler Zielordner für gegebenenfalls eingebettete Audiodaten.
 /// Ausgabe: Geprüftes Songprojekt mit lokaler Audioreferenz oder eine verständliche Archiv-/Validierungsmeldung.
 pub fn load_dbztab(
@@ -181,6 +209,18 @@ pub fn load_dbztab(
     let mut project: SongProject = serde_json::from_slice(&bytes)
         .map_err(|error| format!("Projektmanifest ist ungültig: {error}"))?;
     project.validate()?;
+    for track in &project.stem_tracks {
+        let expected = format!("audio/stems/{}.wav", track.id);
+        let occurrences = archive
+            .file_names()
+            .filter(|name| **name == expected)
+            .count();
+        if occurrences != 1 {
+            return Err(format!(
+                "Projektarchiv benötigt genau einen Stem-Eintrag {expected}."
+            ));
+        }
+    }
     let has_audio = archive.file_names().any(|name| name == "audio/source.wav");
     let audio_size = if has_audio {
         Some(
@@ -213,6 +253,37 @@ pub fn load_dbztab(
         project.audio_path = Some(audio_path);
     } else {
         project.audio_path = None;
+    }
+    let stem_destination = destination.as_ref().join("audio").join("stems");
+    for track in &mut project.stem_tracks {
+        let entry_name = format!("audio/stems/{}.wav", track.id);
+        let entry_size = archive
+            .by_name(&entry_name)
+            .map_err(|error| format!("Stem-Eintrag konnte nicht geprüft werden: {error}"))?
+            .size();
+        if entry_size > MAX_EMBEDDED_AUDIO_BYTES {
+            return Err(format!(
+                "Stem-Eintrag {} überschreitet zwei GiB.",
+                track.name
+            ));
+        }
+        fs::create_dir_all(&stem_destination)
+            .map_err(|error| format!("Stem-Zielordner konnte nicht angelegt werden: {error}"))?;
+        let stem_path = stem_destination.join(format!("{}.wav", track.id));
+        let input = archive
+            .by_name(&entry_name)
+            .map_err(|error| format!("Stem-Eintrag konnte nicht geöffnet werden: {error}"))?;
+        let mut output = File::create(&stem_path)
+            .map_err(|error| format!("Stem-Ziel kann nicht geschrieben werden: {error}"))?;
+        let copied = std::io::copy(&mut input.take(MAX_EMBEDDED_AUDIO_BYTES + 1), &mut output)
+            .map_err(|error| format!("Stem-Eintrag konnte nicht extrahiert werden: {error}"))?;
+        if copied > MAX_EMBEDDED_AUDIO_BYTES {
+            return Err(format!(
+                "Stem-Eintrag {} überschreitet zwei GiB.",
+                track.name
+            ));
+        }
+        track.file_path = stem_path;
     }
     Ok(project)
 }
@@ -381,5 +452,54 @@ mod tests {
         assert_eq!(loaded.duration_seconds, 4.0);
         assert!(loaded.audio_path.is_none());
         assert!(save_dbztab(&project, dir.path().join("wrong.zip")).is_err());
+    }
+
+    /// Zweck: Prüft das Einbetten und sichere Wiederherstellen aller vier Stem-WAVs.
+    /// Eingaben: Keine; erstellt vier synthetische kurze PCM-WAVs und ein `.dbztab`-Projekt.
+    /// Ausgabe: Keine Rückgabe; Assertions sichern Spurmetadaten und kanonische lokale Zielpfade.
+    #[test]
+    fn saves_and_loads_four_stem_wavs_portably() {
+        use crate::audio::write_wav;
+        use crate::project_model::{StemKind, StemTrack};
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("stems.dbztab");
+        let mut project = SongProject::new("Stems", "DBZS");
+        let kinds = [
+            StemKind::Vocals,
+            StemKind::Drums,
+            StemKind::Bass,
+            StemKind::Other,
+        ];
+        for (index, kind) in kinds.into_iter().enumerate() {
+            let wav = dir.path().join(format!("stem-{index}.wav"));
+            write_wav(&wav, &[0.1, -0.1], 44_100, 1).unwrap();
+            project.stem_tracks.push(StemTrack {
+                id: format!("stem-{index}"),
+                name: kind.display_name().into(),
+                kind,
+                file_path: wav,
+                sample_rate: 44_100,
+                channels: 1,
+                duration_seconds: 2.0 / 44_100.0,
+                model_filename: "htdemucs.yaml".into(),
+                model_version: "0.48.0".into(),
+            });
+        }
+        project.validate().unwrap();
+        save_dbztab(&project, &archive).unwrap();
+        let loaded_root = dir.path().join("loaded");
+        let loaded = load_dbztab(&archive, &loaded_root).unwrap();
+        assert_eq!(loaded.stem_tracks.len(), 4);
+        assert!(
+            loaded
+                .stem_tracks
+                .iter()
+                .all(|track| track.file_path.is_file())
+        );
+        assert_eq!(
+            loaded.stem_tracks[0].file_path,
+            loaded_root.join("audio/stems/stem-0.wav")
+        );
     }
 }
