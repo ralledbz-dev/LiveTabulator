@@ -14,13 +14,60 @@ Hinweise:
 */
 import { AboutSlint, Button, ComboBox, LineEdit } from "std-widgets.slint";
 
+// Zweck: Vereinheitlicht die visuellen Design-Tokens der Industrial-Cyan-Workstation.
+// Eingaben: Keine; die Farbtokens sind ausschließlich Präsentationswerte.
+// Ausgabe: Wiederverwendbare Farbwerte ohne Einfluss auf Rust-Callbacks oder Audiozustände.
+export global IndustrialTheme {
+    out property <color> background: #08121c;
+    out property <color> surface: #112130;
+    out property <color> surface-raised: #162b3b;
+    out property <color> border: #2b485b;
+    out property <color> accent: #35d9ed;
+    out property <color> accent-soft: #9be7f2;
+    out property <color> positive: #b5f36b;
+    out property <color> foreground: #e5f3ff;
+    out property <color> muted: #8faabd;
+}
+
+// Zweck: Zeichnet einheitliche kleine Statusanzeigen für die Hauptnavigation.
+// Eingaben: Beschriftung und vom Backend gelieferter Aktivzustand.
+// Ausgabe: Rein visuelle Statusanzeige ohne simulierte Messdaten.
+component StatusChip inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    height: 29px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: active ? #3d7a68 : IndustrialTheme.border;
+    background: active ? #1a403d : IndustrialTheme.surface-raised;
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 9px;
+        spacing: 7px;
+        Rectangle {
+            width: 7px;
+            height: 7px;
+            border-radius: 4px;
+            background: active ? IndustrialTheme.positive : IndustrialTheme.muted;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.label;
+            color: active ? IndustrialTheme.positive : IndustrialTheme.accent-soft;
+            font-size: 10px;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+    }
+}
+
 export component MainWindow inherits Window {
-    title: "DBZS LiveTabulator";
+    title: "DBZS LiveTabulator · Industrial Cyan";
     preferred-width: 1500px;
     preferred-height: 980px;
     min-width: 1080px;
     min-height: 720px;
-    background: #090b12;
+    background: IndustrialTheme.background;
 
     in-out property <string> status_text: "Bereit · lokale Verarbeitung";
     in-out property <string> audio_status_text: "Keine Audioquelle ausgewählt.";
@@ -216,22 +263,43 @@ export component MainWindow inherits Window {
         spacing: 0px;
 
         Rectangle {
-            height: 62px;
-            background: #0d1019;
+            height: 72px;
+            background: #0c1a27;
             HorizontalLayout {
                 padding-left: 20px;
                 padding-right: 20px;
-                spacing: 14px;
-                Text { text: "DBZS"; color: #aa85ff; font-size: 25px; font-weight: 700; }
-                Text { text: "LIVE TABULATOR"; color: #eef0fa; font-size: 16px; font-weight: 700; }
-                Text { text: "MUSIK-ANALYSE · TABS · PLAYBACK"; color: #858aa1; font-size: 10px; }
-                Rectangle { horizontal-stretch: 1; background: transparent; }
+                spacing: 12px;
                 Rectangle {
-                    width: 11px; height: 11px; border-radius: 6px;
-                    background: root.live_running ? #74e0ad : #686e82;
+                    width: 5px;
+                    height: 36px;
+                    border-radius: 3px;
+                    background: IndustrialTheme.accent;
+                    vertical-alignment: center;
                 }
-                Text { text: root.live_running ? "LIVE" : "BEREIT"; color: root.live_running ? #83d9ac : #aab0c3; font-size: 11px; font-weight: 700; }
-                Text { text: root.status_text; color: #aeb4c8; font-size: 11px; wrap: word-wrap; }
+                VerticalLayout {
+                    width: 185px;
+                    spacing: 2px;
+                    Text { text: "DBZS / LIVE TABULATOR"; color: IndustrialTheme.foreground; font-size: 15px; font-weight: 800; }
+                    Text { text: "INDUSTRIAL AUDIO WORKSTATION"; color: IndustrialTheme.accent; font-size: 9px; font-weight: 700; }
+                }
+                Rectangle { width: 1px; background: IndustrialTheme.border; }
+                Button {
+                    text: "Audio öffnen";
+                    enabled: !root.busy;
+                    // Zweck: Öffnet über den existierenden Rust-Callback eine Audiodatei.
+                    // Eingaben: Nutzerklick; Ausgabe: Callback-Anforderung an den Controller.
+                    clicked => { root.select_audio_requested(); }
+                }
+                Button {
+                    text: root.live_running ? "Live stoppen" : "Live starten";
+                    enabled: !root.busy && (!root.recording);
+                    // Zweck: Schaltet die echte Audioquelle über die vorhandenen Start-/Stopp-Callbacks.
+                    // Eingaben: Nutzerklick; Ausgabe: Ein vorhandener Rust-Audio-Command.
+                    clicked => { if root.live_running { root.stop_live_requested(); } else { root.start_live_requested(); } }
+                }
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+                StatusChip { label: root.live_running ? "LIVE AUDIO" : "AUDIO BEREIT"; active: root.live_running; }
+                StatusChip { label: root.runtime_loaded ? "LLM GELADEN" : "LLM OFFLINE"; active: root.runtime_loaded; }
                 Button {
                     text: root.show_observer ? "Observer −" : "Observer +";
                     // Zweck: Klappt das Diagnosepanel ein oder aus.
@@ -248,23 +316,36 @@ export component MainWindow inherits Window {
                 }
             }
         }
-        Rectangle { height: 1px; background: #272a3a; }
+        Rectangle { height: 2px; background: IndustrialTheme.accent; }
+
+        Rectangle {
+            height: 29px;
+            background: #102333;
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                spacing: 12px;
+                Text { text: "SESSION /"; color: IndustrialTheme.accent; font-size: 10px; font-weight: 700; vertical-alignment: center; }
+                Text { text: root.project_status_text; color: IndustrialTheme.muted; font-size: 10px; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                Text { text: root.status_text; color: IndustrialTheme.positive; font-size: 10px; vertical-alignment: center; overflow: elide; }
+            }
+        }
 
         HorizontalLayout {
-            padding: 14px;
-            spacing: 12px;
+            padding: 12px;
+            spacing: 10px;
             vertical-stretch: 1;
 
             VerticalLayout {
-                width: 258px;
+                width: 246px;
                 spacing: 10px;
 
                 Rectangle {
                     height: 184px;
-                    background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                    background: #112130; border-color: #2b485b; border-width: 1px; border-radius: 10px;
                     VerticalLayout {
                         padding: 13px; spacing: 7px;
-                        Text { text: "PROJEKT"; color: #b49aff; font-size: 11px; font-weight: 700; }
+                        Text { text: "PROJEKT"; color: #35d9ed; font-size: 11px; font-weight: 700; }
                         LineEdit { text <=> root.project_path_text; enabled: !root.project_busy; }
                         HorizontalLayout {
                             spacing: 6px;
@@ -299,17 +380,17 @@ export component MainWindow inherits Window {
                             // Ausgabe: Kein Rückgabewert; Auswahl wird importiert.
                             clicked => { root.select_bandmap_requested(); }
                         }
-                        Text { text: root.project_status_text; color: #aeb4c8; font-size: 10px; wrap: word-wrap; vertical-stretch: 1; }
+                        Text { text: root.project_status_text; color: #a9c2d2; font-size: 10px; wrap: word-wrap; vertical-stretch: 1; }
                     }
                 }
 
                 Rectangle {
                     height: 350px;
-                    background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                    background: #112130; border-color: #2b485b; border-width: 1px; border-radius: 10px;
                     VerticalLayout {
                         padding: 13px; spacing: 7px;
-                        Text { text: "AUDIO INPUT"; color: #b49aff; font-size: 11px; font-weight: 700; }
-                        Text { text: root.audio_status_text; color: #c5c8d6; font-size: 10px; wrap: word-wrap; }
+                        Text { text: "AUDIO INPUT"; color: #35d9ed; font-size: 11px; font-weight: 700; }
+                        Text { text: root.audio_status_text; color: #d3e6f2; font-size: 10px; wrap: word-wrap; }
                         HorizontalLayout {
                             spacing: 6px;
                             ComboBox {
@@ -326,7 +407,7 @@ export component MainWindow inherits Window {
                                 clicked => { root.scan_audio_devices_requested(); }
                             }
                         }
-                        Text { text: root.audio_device_status_text; color: #858aa1; font-size: 9px; wrap: word-wrap; }
+                        Text { text: root.audio_device_status_text; color: #7895aa; font-size: 9px; wrap: word-wrap; }
                         LineEdit { text <=> root.audio_path_text; enabled: !root.busy; }
                         HorizontalLayout {
                             spacing: 6px;
@@ -402,18 +483,18 @@ export component MainWindow inherits Window {
                             // Ausgabe: Kein Rückgabewert; der Rust-Job beendet den Unterprozess.
                             clicked => { root.cancel_stem_separation_requested(); }
                         }
-                        Text { text: root.stem_status_text; color: #aeb4c8; font-size: 9px; wrap: word-wrap; }
+                        Text { text: root.stem_status_text; color: #a9c2d2; font-size: 9px; wrap: word-wrap; }
                     }
                 }
 
                 Rectangle {
                     vertical-stretch: 1;
-                    background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                    background: #112130; border-color: #2b485b; border-width: 1px; border-radius: 10px;
                     VerticalLayout {
                         padding: 13px; spacing: 7px;
-                        Text { text: "ANALYSE & MODELLE"; color: #b49aff; font-size: 11px; font-weight: 700; }
-                        Text { text: root.worker_status_text; color: #83d9ac; font-size: 10px; wrap: word-wrap; }
-                        Text { text: root.model_status_text; color: #c5c8d6; font-size: 10px; wrap: word-wrap; }
+                        Text { text: "ANALYSE & MODELLE"; color: #35d9ed; font-size: 11px; font-weight: 700; }
+                        Text { text: root.worker_status_text; color: #b5f36b; font-size: 10px; wrap: word-wrap; }
+                        Text { text: root.model_status_text; color: #d3e6f2; font-size: 10px; wrap: word-wrap; }
                         Button {
                             text: root.scanning ? "Modelle werden geprüft …" : "Modellwurzeln scannen";
                             enabled: !root.scanning && !root.busy;
@@ -449,70 +530,92 @@ export component MainWindow inherits Window {
                 spacing: 10px;
 
                 Rectangle {
-                    height: 108px;
-                    background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                    height: 118px;
+                    background: #162b3b; border-color: #32778b; border-width: 1px; border-radius: 10px;
                     HorizontalLayout {
                         padding: 14px; spacing: 10px;
                         VerticalLayout {
                             width: 150px; spacing: 4px;
-                            Text { text: "AKTUELLER AKKORD"; color: #9298ae; font-size: 9px; font-weight: 700; }
-                            Text { text: root.current_chord_text; color: #52d9f7; font-size: 31px; font-weight: 700; }
+                            Text { text: "LIVE / AKKORD"; color: #8faabd; font-size: 10px; font-weight: 700; }
+                            Text { text: root.current_chord_text; color: #b5f36b; font-size: 31px; font-weight: 700; }
                             Text { text: root.confidence_text; color: #9ca3ba; font-size: 10px; }
                         }
-                        Rectangle { width: 1px; background: #292d42; }
+                        Rectangle { width: 1px; background: #2b485b; }
                         VerticalLayout {
                             width: 150px; spacing: 4px;
-                            Text { text: "TONART & SKALA"; color: #9298ae; font-size: 9px; font-weight: 700; }
-                            Text { text: root.current_key_text; color: #c0a3ff; font-size: 20px; font-weight: 700; }
-                            Text { text: root.scales_text; color: #aeb4c8; font-size: 9px; wrap: word-wrap; vertical-stretch: 1; }
+                            Text { text: "TONART / SKALA"; color: #8faabd; font-size: 10px; font-weight: 700; }
+                            Text { text: root.current_key_text; color: #9be7f2; font-size: 20px; font-weight: 700; }
+                            Text { text: root.scales_text; color: #a9c2d2; font-size: 9px; wrap: word-wrap; vertical-stretch: 1; }
                         }
-                        Rectangle { width: 1px; background: #292d42; }
+                        Rectangle { width: 1px; background: #2b485b; }
                         VerticalLayout {
                             width: 100px; spacing: 4px;
-                            Text { text: "TEMPO"; color: #9298ae; font-size: 9px; font-weight: 700; }
-                            Text { text: root.bpm_text; color: #83d9ac; font-size: 20px; font-weight: 700; }
-                            Text { text: "Tempo-Override"; color: #858aa1; font-size: 9px; }
+                            Text { text: "BEAT / TEMPO"; color: #8faabd; font-size: 10px; font-weight: 700; }
+                            Text { text: root.bpm_text; color: #b5f36b; font-size: 20px; font-weight: 700; }
+                            Text { text: "Tempo-Override"; color: #7895aa; font-size: 9px; }
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
                         VerticalLayout {
                             width: 140px; spacing: 5px;
-                            Text { text: "JOBSTATUS"; color: #9298ae; font-size: 9px; font-weight: 700; }
+                            Text { text: "ENGINE / STATUS"; color: #8faabd; font-size: 10px; font-weight: 700; }
                             Text { text: root.deep_running ? "Deep-Analyse" : (root.live_running ? "Liveanalyse" : "Bereit"); color: #d1d5e4; font-size: 13px; font-weight: 600; }
-                            Text { text: root.selection_status_text; color: #858aa1; font-size: 9px; wrap: word-wrap; }
+                            Text { text: root.selection_status_text; color: #7895aa; font-size: 9px; wrap: word-wrap; }
                         }
                     }
                 }
 
                 Rectangle {
-                    height: 130px;
-                    background: #0e121d; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                    height: 145px;
+                    background: #0b1b29; border-color: #2b485b; border-width: 1px; border-radius: 10px;
                     VerticalLayout {
                         padding: 12px; spacing: 6px;
                         HorizontalLayout {
-                            Text { text: "WAVEFORM · PEGEL"; color: #b49aff; font-size: 10px; font-weight: 700; }
+                            Text { text: "01 / WAVEFORM + SIGNALMONITOR"; color: #35d9ed; font-size: 11px; font-weight: 700; }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
-                            Text { text: root.audio_status_text; color: #858aa1; font-size: 9px; wrap: word-wrap; }
+                            Text { text: root.audio_status_text; color: #7895aa; font-size: 9px; wrap: word-wrap; }
                         }
-                        Text {
-                            text: root.waveform_text; color: #50d3f2; font-size: 12px; font-family: "Consolas";
-                            wrap: word-wrap; vertical-stretch: 1; vertical-alignment: center;
+                        Rectangle {
+                            vertical-stretch: 1;
+                            background: #091925;
+                            border-radius: 6px;
+                            border-color: #25485b;
+                            border-width: 1px;
+                            VerticalLayout {
+                                padding: 10px;
+                                spacing: 6px;
+                                Text {
+                                    text: root.waveform_text;
+                                    color: IndustrialTheme.accent;
+                                    font-size: 12px;
+                                    font-family: "Consolas";
+                                    wrap: word-wrap;
+                                    vertical-stretch: 1;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle { height: 1px; background: #31546b; }
+                                HorizontalLayout {
+                                    Text { text: root.live_running ? "● SIGNAL AKTIV" : "○ SIGNAL INAKTIV"; color: root.live_running ? IndustrialTheme.positive : IndustrialTheme.muted; font-size: 9px; }
+                                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                                    Text { text: "WASAPI / ASIO  ·  NATIVE DSP"; color: IndustrialTheme.muted; font-size: 9px; }
+                                }
+                            }
                         }
                     }
                 }
 
                 Rectangle {
                     vertical-stretch: 1;
-                    background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                    background: #112130; border-color: #2b485b; border-width: 1px; border-radius: 10px;
                     VerticalLayout {
                         padding: 12px; spacing: 6px;
                         HorizontalLayout {
-                            Text { text: "AKKORD-TIMELINE"; color: #b49aff; font-size: 10px; font-weight: 700; }
+                            Text { text: "02 / AKKORD-TIMELINE"; color: #35d9ed; font-size: 11px; font-weight: 700; }
                             Rectangle { horizontal-stretch: 1; background: transparent; }
-                            Text { text: root.beatgrid_text; color: #9298ae; font-size: 9px; wrap: word-wrap; }
+                            Text { text: root.beatgrid_text; color: #8faabd; font-size: 9px; wrap: word-wrap; }
                         }
-                        Rectangle { height: 1px; background: #272a3a; }
+                        Rectangle { height: 1px; background: #2b485b; }
                         Text {
-                            text: root.chord_timeline_text; color: #dce0ef; font-size: 11px; font-family: "Consolas";
+                            text: root.chord_timeline_text; color: #e5f3ff; font-size: 11px; font-family: "Consolas";
                             wrap: word-wrap; vertical-stretch: 1; vertical-alignment: top;
                         }
                         HorizontalLayout {
@@ -528,7 +631,7 @@ export component MainWindow inherits Window {
                         }
                         HorizontalLayout {
                             spacing: 6px;
-                            Text { text: "Downbeat (s)"; color: #9298ae; font-size: 9px; vertical-alignment: center; }
+                            Text { text: "Downbeat (s)"; color: #8faabd; font-size: 9px; vertical-alignment: center; }
                             LineEdit { text <=> root.downbeat_offset_text; enabled: !root.busy; }
                             Button {
                                 text: "Beatgrid verschieben"; enabled: !root.busy;
@@ -546,11 +649,11 @@ export component MainWindow inherits Window {
                     spacing: 10px;
                     Rectangle {
                         horizontal-stretch: 1;
-                        background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                        background: #112130; border-color: #2b485b; border-width: 1px; border-radius: 10px;
                         VerticalLayout {
                             padding: 12px; spacing: 6px;
                             HorizontalLayout {
-                                Text { text: "GITARREN-TAB"; color: #b49aff; font-size: 10px; font-weight: 700; }
+                                Text { text: "03 / GITARREN-TAB"; color: #35d9ed; font-size: 11px; font-weight: 700; }
                                 Rectangle { horizontal-stretch: 1; background: transparent; }
                                 Button {
                                     text: "Tabs erzeugen"; enabled: !root.busy;
@@ -560,17 +663,17 @@ export component MainWindow inherits Window {
                                     clicked => { root.generate_tabs_requested(); }
                                 }
                             }
-                            Text { text: root.tab_text; color: #e0e4f1; font-size: 11px; font-family: "Consolas"; wrap: word-wrap; vertical-stretch: 1; }
-                            Text { text: root.fretboard_text; color: #50d3f2; font-size: 10px; wrap: word-wrap; }
+                            Text { text: root.tab_text; color: #e5f3ff; font-size: 11px; font-family: "Consolas"; wrap: word-wrap; vertical-stretch: 1; }
+                            Text { text: root.fretboard_text; color: #35d9ed; font-size: 10px; wrap: word-wrap; }
                         }
                     }
                     Rectangle {
                         horizontal-stretch: 1;
-                        background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                        background: #112130; border-color: #2b485b; border-width: 1px; border-radius: 10px;
                         VerticalLayout {
                             padding: 12px; spacing: 6px;
                             HorizontalLayout {
-                                Text { text: "LYRICS & BEATGRID"; color: #b49aff; font-size: 10px; font-weight: 700; }
+                                Text { text: "04 / LYRICS + BEATGRID"; color: #35d9ed; font-size: 11px; font-weight: 700; }
                                 Rectangle { horizontal-stretch: 1; background: transparent; }
                                 Button {
                                     text: "Lyrics-Job"; enabled: !root.busy && !root.deep_running;
@@ -580,7 +683,7 @@ export component MainWindow inherits Window {
                                     clicked => { root.start_lyrics_requested(); }
                                 }
                             }
-                            Text { text: root.lyrics_text; color: #e0e4f1; font-size: 10px; wrap: word-wrap; vertical-stretch: 1; }
+                            Text { text: root.lyrics_text; color: #e5f3ff; font-size: 10px; wrap: word-wrap; vertical-stretch: 1; }
                             HorizontalLayout {
                                 spacing: 5px;
                                 LineEdit { text <=> root.lyrics_edit_text; enabled: !root.busy; }
@@ -592,45 +695,45 @@ export component MainWindow inherits Window {
                                     clicked => { root.edit_lyrics_requested(root.lyrics_line_index, root.lyrics_edit_text); }
                                 }
                             }
-                            Text { text: "Bearbeitungen werden gegen das Songmodell validiert."; color: #858aa1; font-size: 9px; wrap: word-wrap; }
+                            Text { text: "Bearbeitungen werden gegen das Songmodell validiert."; color: #7895aa; font-size: 9px; wrap: word-wrap; }
                         }
                     }
                 }
             }
 
             VerticalLayout {
-                width: 270px;
+                width: 258px;
                 spacing: 10px;
 
                 Rectangle {
                     height: 204px;
-                    background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                    background: #112130; border-color: #2b485b; border-width: 1px; border-radius: 10px;
                     VerticalLayout {
                         padding: 13px; spacing: 7px;
-                        Text { text: "FRETBOARD · EADGBE"; color: #b49aff; font-size: 10px; font-weight: 700; }
-                        Text { text: root.fretboard_text; color: #dce0ef; font-size: 10px; font-family: "Consolas"; wrap: word-wrap; vertical-stretch: 1; }
-                        Text { text: "Standardstimmung · Capo 0"; color: #858aa1; font-size: 9px; }
-                        Text { text: "Die Position wird aus NoteEvents und Stimmung berechnet."; color: #858aa1; font-size: 9px; wrap: word-wrap; }
+                        Text { text: "FRETBOARD · EADGBE"; color: #35d9ed; font-size: 10px; font-weight: 700; }
+                        Text { text: root.fretboard_text; color: #e5f3ff; font-size: 10px; font-family: "Consolas"; wrap: word-wrap; vertical-stretch: 1; }
+                        Text { text: "Standardstimmung · Capo 0"; color: #7895aa; font-size: 9px; }
+                        Text { text: "Die Position wird aus NoteEvents und Stimmung berechnet."; color: #7895aa; font-size: 9px; wrap: word-wrap; }
                     }
                 }
 
                 Rectangle {
                     height: 142px;
-                    background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                    background: #112130; border-color: #2b485b; border-width: 1px; border-radius: 10px;
                     VerticalLayout {
                         padding: 13px; spacing: 7px;
-                        Text { text: "SKALEN & MODI"; color: #b49aff; font-size: 10px; font-weight: 700; }
-                        Text { text: root.scales_text; color: #dce0ef; font-size: 10px; wrap: word-wrap; vertical-stretch: 1; }
+                        Text { text: "SKALEN & MODI"; color: #35d9ed; font-size: 10px; font-weight: 700; }
+                        Text { text: root.scales_text; color: #e5f3ff; font-size: 10px; wrap: word-wrap; vertical-stretch: 1; }
                     }
                 }
 
                 Rectangle {
                     height: 238px;
-                    background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                    background: #112130; border-color: #2b485b; border-width: 1px; border-radius: 10px;
                     VerticalLayout {
                         padding: 13px; spacing: 6px;
-                        Text { text: "SPUREN & MIXER"; color: #b49aff; font-size: 10px; font-weight: 700; }
-                        Text { text: root.tracks_text; color: #c5c8d6; font-size: 10px; font-family: "Consolas"; wrap: word-wrap; vertical-stretch: 1; }
+                        Text { text: "SPUREN & MIXER"; color: #35d9ed; font-size: 10px; font-weight: 700; }
+                        Text { text: root.tracks_text; color: #d3e6f2; font-size: 10px; font-family: "Consolas"; wrap: word-wrap; vertical-stretch: 1; }
                         HorizontalLayout {
                             spacing: 4px;
                             Button {
@@ -671,18 +774,18 @@ export component MainWindow inherits Window {
                                 // Ausgabe: Kein Rückgabewert; gemeinsamer Playhead bleibt erhalten.
                                 clicked => { root.select_audio_source_requested("stem-other"); }
                             }
-                            Text { text: "Aktiv: " + root.active_audio_source_label; color: #858aa1; font-size: 9px; vertical-alignment: center; }
+                            Text { text: "Aktiv: " + root.active_audio_source_label; color: #7895aa; font-size: 9px; vertical-alignment: center; }
                         }
                     }
                 }
 
                 Rectangle {
                     vertical-stretch: 1;
-                    background: #111522; border-color: #292d42; border-width: 1px; border-radius: 10px;
+                    background: #112130; border-color: #2b485b; border-width: 1px; border-radius: 10px;
                     VerticalLayout {
                         padding: 13px; spacing: 7px;
-                        Text { text: "LOKALER MUSIKASSISTENT"; color: #b49aff; font-size: 10px; font-weight: 700; }
-                        Text { text: root.model_status_text; color: #aeb4c8; font-size: 9px; wrap: word-wrap; }
+                        Text { text: "LOKALER MUSIKASSISTENT"; color: #35d9ed; font-size: 10px; font-weight: 700; }
+                        Text { text: root.model_status_text; color: #a9c2d2; font-size: 9px; wrap: word-wrap; }
                         LineEdit { text <=> root.prompt_text; enabled: root.runtime_loaded && !root.busy; }
                         Button {
                             text: root.busy ? "Läuft lokal …" : "Lokal erklären";
@@ -692,15 +795,15 @@ export component MainWindow inherits Window {
                             // Ausgabe: Kein Rückgabewert; Ergebnis wird in `assistant_output_text` angezeigt.
                             clicked => { root.generate_requested(); }
                         }
-                        Text { text: root.assistant_output_text; color: #dce0ef; font-size: 9px; wrap: word-wrap; vertical-stretch: 1; }
+                        Text { text: root.assistant_output_text; color: #e5f3ff; font-size: 9px; wrap: word-wrap; vertical-stretch: 1; }
                     }
                 }
             }
         }
 
         Rectangle {
-            height: 74px;
-            background: #0d1019;
+            height: 80px;
+            background: #0c1a27;
             VerticalLayout {
                 padding-left: 16px; padding-right: 16px; spacing: 4px;
                 HorizontalLayout {
@@ -727,7 +830,7 @@ export component MainWindow inherits Window {
                         // Ausgabe: Kein Rückgabewert; meldet den neuen Loopzustand an den Controller.
                         clicked => { root.loop_enabled = !root.loop_enabled; root.loop_changed(root.loop_enabled); }
                     }
-                    Text { text: "Tempo"; color: #9298ae; font-size: 10px; }
+                    Text { text: "Tempo"; color: #8faabd; font-size: 10px; }
                     Button {
                         text: "−5 %";
                         // Zweck: Senkt das Playbacktempo um fünf Prozentpunkte.
@@ -735,7 +838,7 @@ export component MainWindow inherits Window {
                         // Ausgabe: Kein Rückgabewert; signalisiert den Prozentwert an den Playback-Service.
                         clicked => { root.tempo_percent = max(50, root.tempo_percent - 5); root.tempo_changed(root.tempo_percent); }
                     }
-                    Text { text: root.tempo_percent + "%"; color: #83d9ac; font-size: 11px; font-weight: 700; }
+                    Text { text: root.tempo_percent + "%"; color: #b5f36b; font-size: 11px; font-weight: 700; }
                     Button {
                         text: "+5 %";
                         // Zweck: Erhöht das Playbacktempo um fünf Prozentpunkte.
@@ -744,13 +847,13 @@ export component MainWindow inherits Window {
                         clicked => { root.tempo_percent = min(150, root.tempo_percent + 5); root.tempo_changed(root.tempo_percent); }
                     }
                     Rectangle { horizontal-stretch: 1; background: transparent; }
-                    Text { text: root.playback_position_text; color: #dce0ef; font-size: 11px; font-family: "Consolas"; }
+                    Text { text: root.playback_position_text; color: #e5f3ff; font-size: 11px; font-family: "Consolas"; }
                     Text { text: "·"; color: #555a70; font-size: 14px; }
-                    Text { text: root.beatgrid_text; color: #9298ae; font-size: 9px; wrap: word-wrap; }
+                    Text { text: root.beatgrid_text; color: #8faabd; font-size: 9px; wrap: word-wrap; }
                 }
                 HorizontalLayout {
                     spacing: 6px;
-                    Text { text: "EXPORT"; color: #9298ae; font-size: 9px; font-weight: 700; }
+                    Text { text: "EXPORT"; color: #8faabd; font-size: 9px; font-weight: 700; }
                     Button {
                         text: "TXT";
                         // Zweck: Exportiert Akkorde, Lyrics und Tabs als Klartext.
@@ -787,16 +890,16 @@ export component MainWindow inherits Window {
 
         if root.show_observer: Rectangle {
             height: 126px;
-            background: #0b0e16;
-            border-color: #272a3a; border-width: 1px;
+            background: #0a1723;
+            border-color: #2b485b; border-width: 1px;
             VerticalLayout {
                 padding: 11px; spacing: 5px;
                 HorizontalLayout {
-                    Text { text: "DEV OBSERVER"; color: #b49aff; font-size: 10px; font-weight: 700; }
+                    Text { text: "DEV OBSERVER"; color: #35d9ed; font-size: 10px; font-weight: 700; }
                     Rectangle { horizontal-stretch: 1; background: transparent; }
-                    Text { text: "Keine ungemessenen Hardwarewerte"; color: #858aa1; font-size: 9px; }
+                    Text { text: "Keine ungemessenen Hardwarewerte"; color: #7895aa; font-size: 9px; }
                 }
-                Text { text: root.observer_text; color: #aeb4c8; font-size: 9px; font-family: "Consolas"; wrap: word-wrap; vertical-stretch: 1; vertical-alignment: top; }
+                Text { text: root.observer_text; color: #a9c2d2; font-size: 9px; font-family: "Consolas"; wrap: word-wrap; vertical-stretch: 1; vertical-alignment: top; }
             }
         }
     }
@@ -804,15 +907,15 @@ export component MainWindow inherits Window {
     if root.stem_download_prompt_open: Rectangle {
         x: 0px; y: 0px; width: root.width; height: root.height;
         background: #080a11;
-        border-color: #4d4070; border-width: 1px;
+        border-color: #2b7b89; border-width: 1px;
         VerticalLayout {
             alignment: center;
             Rectangle {
                 width: 580px; height: 330px;
-                background: #151a29; border-color: #8067b9; border-width: 1px; border-radius: 12px;
+                background: #162b3b; border-color: #35d9ed; border-width: 1px; border-radius: 12px;
                 VerticalLayout {
                     padding: 18px; spacing: 12px;
-                    Text { text: "MODELLDOWNLOAD BESTÄTIGEN"; color: #c5adff; font-size: 13px; font-weight: 700; }
+                    Text { text: "MODELLDOWNLOAD BESTÄTIGEN"; color: #9be7f2; font-size: 13px; font-weight: 700; }
                     Text { text: root.stem_download_prompt_text; color: #d3d6e2; font-size: 10px; wrap: word-wrap; vertical-stretch: 1; vertical-alignment: top; }
                     HorizontalLayout {
                         spacing: 8px;
@@ -844,13 +947,13 @@ export component MainWindow inherits Window {
         y: 70px;
         width: 340px;
         height: 190px;
-        background: #151a29;
-        border-color: #4d4070;
+        background: #162b3b;
+        border-color: #2b7b89;
         border-width: 1px;
         border-radius: 12px;
         VerticalLayout {
             padding: 14px; spacing: 9px;
-            Text { text: "ÜBER DBZS LIVETABULATOR"; color: #c5adff; font-size: 12px; font-weight: 700; }
+            Text { text: "ÜBER DBZS LIVETABULATOR"; color: #9be7f2; font-size: 12px; font-weight: 700; }
             Text { text: "Lokale, plattformübergreifend geplante Musikanalyse. Live-DSP, Projekte und Playback laufen ohne Cloud-Inferenz."; color: #d3d6e2; font-size: 10px; wrap: word-wrap; }
             AboutSlint { }
         }
