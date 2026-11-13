@@ -825,6 +825,9 @@ export component MainWindow inherits Window {
                         }
                         Button {
                             text: "Nicht herunterladen";
+                            // Zweck: Schließt den Dialog ohne Modell- oder Projektänderung.
+                            // Eingaben: Mausklick.
+                            // Ausgabe: Kein Rückgabewert; der lokale Modellbestand bleibt unverändert.
                             // Zweck: Schließt den Dialog ohne Modelldownload oder Änderung vorhandener Stem-Spuren.
                             // Eingaben: Mausklick.
                             // Ausgabe: Kein Rückgabewert; WAV und DSP-Ergebnis bleiben erhalten, Modellbestand und bisherige Stem-Spuren bleiben unverändert.

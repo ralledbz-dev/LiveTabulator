@@ -80,7 +80,6 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
     let playback: Arc<Mutex<Option<PlaybackOutputSession>>> = Arc::new(Mutex::new(None));
     let deep_job: Arc<Mutex<Option<JobHandle>>> = Arc::new(Mutex::new(None));
     let stem_job: Arc<Mutex<Option<JobHandle>>> = Arc::new(Mutex::new(None));
-    let recording_wav_saved = Arc::new(AtomicBool::new(false));
     let pending_stem_download: Arc<Mutex<Option<StemRunContext>>> = Arc::new(Mutex::new(None));
     let active_audio_source_id = Arc::new(Mutex::new("source".to_string()));
     let playback_clock_started = Arc::new(AtomicBool::new(false));
@@ -512,6 +511,11 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
                 if let Some(handle) = weak.upgrade() {
                     handle.set_stem_download_prompt_open(false);
                     handle.set_stem_status_text(
+                        "Modell nicht heruntergeladen; Projekt und Modellbestand unverändert."
+                            .into(),
+                    );
+                    handle.set_status_text(
+                        "Modell-Download abgelehnt; keine Änderungen vorgenommen.".into(),
                         "Modell nicht heruntergeladen; WAV und DSP-Ergebnis bleiben erhalten, bisherige Stem-Spuren bleiben unverändert."
                             .into(),
                     );
@@ -1479,6 +1483,9 @@ fn start_job_dispatcher(
                     if kind == JobKind::DeepAnalysis {
                         handle.set_deep_running(!terminal);
                         handle.set_busy(!terminal);
+                    }
+                    if kind == JobKind::StemSeparation {
+                        handle.set_stem_running(!terminal);
                     }
                     if kind == JobKind::StemSeparation {
                         handle.set_stem_running(!terminal);
