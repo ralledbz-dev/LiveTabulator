@@ -54,7 +54,7 @@ Der wichtigste Grundsatz:
 ## Kernprinzip
 
 ```text
-Windows Audio Output
+Windows Audio Input: WASAPI-Systemmix oder ASIO-Interfaceeingang
 → Live Capture
 → Audioanalyse
 → Musiktheorie

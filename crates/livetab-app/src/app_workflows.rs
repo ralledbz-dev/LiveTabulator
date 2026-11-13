@@ -97,6 +97,7 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
         Arc::clone(&deep_job),
         Arc::clone(&stem_job),
         Arc::clone(&pending_stem_download),
+        Arc::clone(&recording_wav_saved),
     );
 
     {
@@ -143,7 +144,14 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
                     Ok(names) => {
                         let model = slint::ModelRc::new(std::rc::Rc::new(slint::VecModel::from(names.iter().cloned().map(slint::SharedString::from).collect::<Vec<_>>())));
                         handle.set_audio_device_names(model);
-                        handle.set_audio_device_status_text(format!("{} lokale Quelle(n) verfügbar; Auswahl gilt beim nächsten Live-Start.", names.len()).into());
+                        let status = if cfg!(windows) {
+                            let wasapi_count = names.iter().filter(|name| name.starts_with("WASAPI · ")).count();
+                            let asio_count = names.iter().filter(|name| name.starts_with("ASIO · ")).count();
+                            format!("{wasapi_count} WASAPI-Systemmixquelle(n) · {asio_count} ASIO-Treiber; Auswahl gilt beim nächsten Live-Start.")
+                        } else {
+                            format!("{} lokale Quelle(n) verfügbar; Auswahl gilt beim nächsten Live-Start.", names.len())
+                        };
+                        handle.set_audio_device_status_text(status.into());
                     }
                     Err(error) => handle.set_audio_device_status_text(error.into()),
                 });
@@ -231,6 +239,8 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
         let weak = ui.as_weak();
         let capture = Arc::clone(&capture);
         let controller = controller.clone();
+        let deep_job = Arc::clone(&deep_job);
+        let recording_wav_saved = Arc::clone(&recording_wav_saved);
         ui.on_toggle_recording_requested(move || {
             let Some(handle) = weak.upgrade() else { return };
             if !handle.get_recording() {
@@ -277,25 +287,82 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
                 }
             };
             handle.set_recording(false);
-            handle.set_worker_status_text("WAV wird lokal geschrieben …".into());
+            handle.set_deep_running(true);
+            handle.set_busy(true);
+            handle.set_worker_status_text(
+                "Liveaufnahme wird lokal gespeichert und anschließend vollständig analysiert …"
+                    .into(),
+            );
+            recording_wav_saved.store(false, Ordering::Release);
             let manager = controller.job_manager();
+            let analysis_controller = controller.clone();
             let weak_after_save = weak.clone();
-            let saved_controller = controller.clone();
-            manager.start(JobKind::Recording, move |reporter, cancellation| {
+            let weak_after_analysis = weak.clone();
+            let path_for_ui = path.clone();
+            let recording_wav_saved = Arc::clone(&recording_wav_saved);
+            let job = manager.start(JobKind::DeepAnalysis, move |reporter, cancellation| {
+                reporter.progress(0.05, "Live-Audio wird als lokale Mono-WAV gespeichert");
+                let saved_path_for_ui = path.clone();
+                let save_reporter = reporter.clone();
+                let summary = save_and_analyze_recording(
+                    &analysis_controller,
+                    &path,
+                    samples,
+                    sample_rate,
+                    || cancellation.is_cancelled(),
+                    move |waveform, duration_seconds, rate| {
+                        recording_wav_saved.store(true, Ordering::Release);
+                        save_reporter.progress(
+                            0.2,
+                            "WAV gesichert · vollständige lokale DSP-Analyse läuft",
+                        );
+                        let _ = weak_after_save.upgrade_in_event_loop(move |handle| {
+                            handle.set_audio_path_text(
+                                saved_path_for_ui.to_string_lossy().into_owned().into(),
+                            );
+                            handle.set_audio_status_text(
+                                format!(
+                                    "Live-Audio-WAV gesichert · {:.2}s · {rate} Hz · Offline-Analyse läuft",
+                                    duration_seconds
+                                )
+                                .into(),
+                            );
+                            handle.set_waveform_text(waveform.into());
+                        });
+                    },
+                )?;
                 cancellation.check()?;
-                reporter.progress(0.05, "Mono-PCM wird in RIFF/WAVE gepackt");
-                write_wav(&path, &samples, sample_rate, 1).map_err(|error| error.to_string())?;
-                reporter.progress(1.0, "WAV-Datei lokal gespeichert");
-                let path_for_ui = path.clone();
-                let _ = weak_after_save.upgrade_in_event_loop(move |handle| {
-                    handle.set_audio_path_text(path_for_ui.to_string_lossy().into_owned().into());
-                    handle.set_audio_status_text(
-                        "Live-WAV gespeichert · wird als Playbackquelle geöffnet".into(),
+                reporter.progress(0.95, "Analyseergebnis wird in das Songprojekt übernommen");
+                let message = format!(
+                    "Aufnahme gespeichert und analysiert: {} Akkorde · {} Noten · {} Frames · {}",
+                    summary.chord_count,
+                    summary.note_count,
+                    summary.analyzed_frames,
+                    path.display()
+                );
+                let completed_path = path_for_ui.clone();
+                let _ = weak_after_analysis.upgrade_in_event_loop(move |handle| {
+                    handle.set_audio_path_text(
+                        completed_path.to_string_lossy().into_owned().into(),
                     );
-                    open_audio_async(handle.as_weak(), saved_controller, path_for_ui);
+                    handle.set_audio_status_text(
+                        format!(
+                            "Live-Audio analysiert · {:.2}s · {} Hz · {} Akkorde · {} Noten",
+                            summary.duration_seconds,
+                            summary.sample_rate,
+                            summary.chord_count,
+                            summary.note_count
+                        )
+                        .into(),
+                    );
+                    update_project_view(&handle, &analysis_controller);
                 });
-                Ok(format!("Aufnahme gespeichert: {}", path.display()))
+                reporter.progress(1.0, "Live-Audio-WAV gespeichert und offline analysiert");
+                Ok(message)
             });
+            if let Ok(mut active) = deep_job.lock() {
+                *active = Some(job);
+            }
         });
     }
     {
@@ -316,6 +383,7 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
                 return;
             };
             handle.set_deep_running(true);
+            handle.set_busy(true);
             handle.set_worker_status_text("Abbrechbare lokale DSP-Analyse läuft …".into());
             let controller = controller.clone();
             let manager = controller.job_manager();
@@ -448,6 +516,12 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
                     );
                     handle.set_status_text(
                         "Modell-Download abgelehnt; keine Änderungen vorgenommen.".into(),
+                        "Modell nicht heruntergeladen; WAV und DSP-Ergebnis bleiben erhalten, bisherige Stem-Spuren bleiben unverändert."
+                            .into(),
+                    );
+                    handle.set_status_text(
+                        "Modell-Download abgelehnt; Modellbestand und vorhandene Stem-Spuren wurden nicht geändert."
+                            .into(),
                     );
                 }
             });
@@ -980,6 +1054,52 @@ fn open_audio_async(weak: Weak<MainWindow>, controller: AppController, path: Pat
     });
 }
 
+/// Ergebnis der lokalen Vollanalyse einer zuvor gespeicherten Liveaufnahme.
+#[derive(Debug)]
+struct RecordingAnalysisSummary {
+    sample_rate: u32,
+    duration_seconds: f64,
+    chord_count: usize,
+    note_count: usize,
+    analyzed_frames: usize,
+}
+
+/// Zweck: Speichert erfasste Live-Audiosamples beliebiger lokaler Quellen als WAV und startet die vollständige Rust-DSP-Analyse.
+/// Eingaben: Controller, WAV-Ziel, besessene Mono-Samples, Sample-Rate, kooperative Abfrage und Callback nach erfolgreichem Schreiben.
+/// Ausgabe: Analysekennzahlen oder ein Schreib-, Kurzsignal-, Datei- oder Abbruchfehler; gespeicherte WAV bleibt bei Analysefehlern erhalten.
+fn save_and_analyze_recording<F, S>(
+    controller: &AppController,
+    path: &std::path::Path,
+    samples: Vec<f32>,
+    sample_rate: u32,
+    mut is_cancelled: F,
+    after_save: S,
+) -> Result<RecordingAnalysisSummary, String>
+where
+    F: FnMut() -> bool,
+    S: FnOnce(String, f64, u32),
+{
+    if sample_rate == 0 || samples.is_empty() {
+        return Err("Die Liveaufnahme enthält keine gültigen Samples.".into());
+    }
+    if is_cancelled() {
+        return Err("Aufnahme-Analyse wurde vor dem Speichern abgebrochen.".into());
+    }
+    write_wav(path, &samples, sample_rate, 1).map_err(|error| error.to_string())?;
+    let duration_seconds = samples.len() as f64 / f64::from(sample_rate);
+    let waveform = livetab_core::dsp::waveform_bars(&samples, 72);
+    after_save(waveform, duration_seconds, sample_rate);
+    drop(samples);
+    let result = controller.analyze_audio_file_with_cancel(path, is_cancelled)?;
+    Ok(RecordingAnalysisSummary {
+        sample_rate,
+        duration_seconds: result.duration_seconds,
+        chord_count: result.chords.len(),
+        note_count: result.notes.len(),
+        analyzed_frames: result.analyzed_frames,
+    })
+}
+
 /// Zweck: Öffnet eine lokale WAV-Quelle und startet die synchrone native Audio-/Schedulerwiedergabe.
 /// Eingaben: Fenster, Controller, geteiltes Ausgabehandle, Shutdown-/Clockflags, Tempo und Loopzustand.
 /// Ausgabe: Keine; Gerätefehler und Startstatus werden asynchron an die UI zurückgemeldet.
@@ -1302,6 +1422,7 @@ fn start_job_dispatcher(
     deep_job: Arc<Mutex<Option<JobHandle>>>,
     stem_job: Arc<Mutex<Option<JobHandle>>>,
     pending_stem_download: Arc<Mutex<Option<StemRunContext>>>,
+    recording_wav_saved: Arc<AtomicBool>,
 ) {
     let Some(receiver) = controller.job_manager().take_event_receiver() else {
         return;
@@ -1319,6 +1440,8 @@ fn start_job_dispatcher(
                 let deep_job = Arc::clone(&deep_job);
                 let stem_job = Arc::clone(&stem_job);
                 let pending_stem_download = Arc::clone(&pending_stem_download);
+                let recording_wav_saved = Arc::clone(&recording_wav_saved);
+                let shutdown = Arc::clone(&shutdown);
                 let controller = controller.clone();
                 let _ = weak.clone().upgrade_in_event_loop(move |handle| {
                     let (status, terminal, kind, progress, message) = match event {
@@ -1351,8 +1474,18 @@ fn start_job_dispatcher(
                             status.message,
                         ),
                     };
+                    let recording_followup = recording_followup_after_terminal(
+                        kind,
+                        terminal,
+                        &status,
+                        &recording_wav_saved,
+                    );
                     if kind == JobKind::DeepAnalysis {
                         handle.set_deep_running(!terminal);
+                        handle.set_busy(!terminal);
+                    }
+                    if kind == JobKind::StemSeparation {
+                        handle.set_stem_running(!terminal);
                     }
                     if kind == JobKind::StemSeparation {
                         handle.set_stem_running(!terminal);
@@ -1397,12 +1530,127 @@ fn start_job_dispatcher(
                                 handle.set_status_text(format!("Job beendet: {message}").into());
                             }
                         }
+                        match recording_followup {
+                            RecordingFollowup::StartStems if cfg!(windows) => {
+                                start_recording_stem_followup(
+                                    &handle,
+                                    controller.clone(),
+                                    Arc::clone(&stem_job),
+                                    Arc::clone(&pending_stem_download),
+                                    Arc::clone(&shutdown),
+                                );
+                            }
+                            RecordingFollowup::StartStems => {
+                                handle.set_stem_status_text(
+                                    "WAV gespeichert; automatische Vier-Stem-Trennung ist im Windows-Build verfügbar."
+                                        .into(),
+                                );
+                            }
+                            RecordingFollowup::CancelledAfterSave => {
+                                handle.set_stem_status_text(
+                                    "DSP-Auftrag abgebrochen; die gespeicherte WAV bleibt erhalten, Vier-Stem-Trennung nicht gestartet."
+                                        .into(),
+                                );
+                            }
+                            RecordingFollowup::None => {}
+                        }
                         update_project_view(&handle, &controller);
                     }
                 });
             }
         })
         .ok();
+}
+
+/// Zweck: Entscheidet einmalig, ob eine gespeicherte Live-WAV nach Abschluss der DSP-Aufnahmeverarbeitung den Stem-Folgejob auslöst.
+/// Eingaben: Jobtyp, Terminalstatus, Ergebniszustand und atomarer Merker für eine erfolgreich geschriebene WAV.
+/// Ausgabe: Folgejobstart, bewusster Nichtstart nach Abbruch oder keine aufnahmebezogene Aktion.
+fn recording_followup_after_terminal(
+    kind: JobKind,
+    terminal: bool,
+    status: &JobState,
+    recording_wav_saved: &AtomicBool,
+) -> RecordingFollowup {
+    if kind != JobKind::DeepAnalysis || !terminal {
+        return RecordingFollowup::None;
+    }
+    if !recording_wav_saved.swap(false, Ordering::AcqRel) {
+        return RecordingFollowup::None;
+    }
+    match status {
+        JobState::Succeeded | JobState::Failed => RecordingFollowup::StartStems,
+        JobState::Cancelled => RecordingFollowup::CancelledAfterSave,
+        JobState::Queued | JobState::Running => RecordingFollowup::None,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RecordingFollowup {
+    StartStems,
+    CancelledAfterSave,
+    None,
+}
+
+/// Zweck: Bereitet im Hintergrund den lokalen Vier-Stem-Folgejob vor und startet zunächst ohne Modell-Downloadfreigabe.
+/// Eingaben: UI-Handle, AppController, aktiver Jobpuffer und auftragsgebundener Modellfreigabepuffer.
+/// Ausgabe: Keine; der Job prüft lokale Ressourcen und kann nur über den vorhandenen Bestätigungsdialog Downloads erlauben.
+fn start_recording_stem_followup(
+    handle: &MainWindow,
+    controller: AppController,
+    stem_job: Arc<Mutex<Option<JobHandle>>>,
+    pending_stem_download: Arc<Mutex<Option<StemRunContext>>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    handle.set_busy(true);
+    handle.set_stem_running(true);
+    handle.set_stem_status_text(
+        "Live-WAV gespeichert; prüfe lokale Modellressourcen ohne Downloadfreigabe …".into(),
+    );
+    let weak = handle.as_weak();
+    let worker = thread::Builder::new()
+        .name("livetab-recording-stem-setup".into())
+        .spawn(move || {
+            if shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            let context = controller
+                .snapshot()
+                .and_then(|project| stem_workflow::prepare_context(&project));
+            match context {
+                Ok(context) => {
+                    if shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let job =
+                        stem_workflow::start_job(controller, context, false, pending_stem_download);
+                    if let Ok(mut active) = stem_job.lock() {
+                        *active = Some(job);
+                    } else {
+                        job.cancellation.cancel();
+                    }
+                }
+                Err(error) => {
+                    let _ = weak.upgrade_in_event_loop(move |handle| {
+                        handle.set_busy(false);
+                        handle.set_stem_running(false);
+                        handle.set_stem_status_text(
+                            format!(
+                                "Aufnahme gespeichert; Stem-Vorbereitung fehlgeschlagen: {error}"
+                            )
+                            .into(),
+                        );
+                    });
+                }
+            }
+        });
+    if let Err(error) = worker {
+        handle.set_busy(false);
+        handle.set_stem_running(false);
+        handle.set_stem_status_text(
+            format!("Aufnahme gespeichert; Stem-Vorbereitungsworker konnte nicht starten: {error}")
+                .into(),
+        );
+    }
 }
 
 /// Zweck: Aktualisiert alle Analyseanzeigen aus einer konsistenten Songprojektkopie.
@@ -1794,4 +2042,147 @@ fn format_clock(seconds: f64) -> String {
     let minutes = (safe / 60.0).floor() as u64;
     let remainder = safe - minutes as f64 * 60.0;
     format!("{minutes:02}:{remainder:04.1}")
+}
+
+#[cfg(test)]
+mod recording_workflow_tests {
+    use super::*;
+
+    /// Zweck: Startet Stem-Verarbeitung genau einmal bei terminalem Analyseabschluss einer erfolgreich gespeicherten Aufnahme.
+    /// Eingaben: Keine; prüft fremde/zwischenzeitliche Jobs sowie einen fehlgeschlagenen DSP-Pass.
+    /// Ausgabe: Keine Rückgabe; Assertions sichern Trigger, Merkerverbrauch und Wiederholschutz.
+    #[test]
+    fn recording_stem_followup_is_once_per_saved_terminal_analysis() {
+        let saved = AtomicBool::new(true);
+        assert_eq!(
+            recording_followup_after_terminal(
+                JobKind::StemSeparation,
+                true,
+                &JobState::Succeeded,
+                &saved,
+            ),
+            RecordingFollowup::None
+        );
+        assert!(saved.load(Ordering::Acquire));
+        assert_eq!(
+            recording_followup_after_terminal(
+                JobKind::DeepAnalysis,
+                false,
+                &JobState::Running,
+                &saved,
+            ),
+            RecordingFollowup::None
+        );
+        assert_eq!(
+            recording_followup_after_terminal(
+                JobKind::DeepAnalysis,
+                true,
+                &JobState::Failed,
+                &saved,
+            ),
+            RecordingFollowup::StartStems
+        );
+        assert!(!saved.load(Ordering::Acquire));
+        assert_eq!(
+            recording_followup_after_terminal(
+                JobKind::DeepAnalysis,
+                true,
+                &JobState::Succeeded,
+                &saved,
+            ),
+            RecordingFollowup::None
+        );
+    }
+
+    /// Zweck: Unterdrückt den automatischen Stem-Folgejob, wenn der Nutzer die Nachanalyse abbricht.
+    /// Eingaben: Keine; kennzeichnet eine bereits gespeicherte WAV und beendet den zugehörigen DSP-Job als abgebrochen.
+    /// Ausgabe: Keine Rückgabe; der Abbruch wird gemeldet und der Einmalmerker zurückgesetzt.
+    #[test]
+    fn recording_stem_followup_respects_cancel_after_wav_save() {
+        let saved = AtomicBool::new(true);
+        assert_eq!(
+            recording_followup_after_terminal(
+                JobKind::DeepAnalysis,
+                true,
+                &JobState::Cancelled,
+                &saved,
+            ),
+            RecordingFollowup::CancelledAfterSave
+        );
+        assert!(!saved.load(Ordering::Acquire));
+    }
+
+    /// Zweck: Prüft den echten Save-then-analyze-Pfad mit synthetischem Mono-Audio.
+    /// Eingaben: Keine; erzeugt eine temporäre Ein-Sekunden-WAV und einen Controller.
+    /// Ausgabe: Keine Rückgabe; bestätigt WAV, Analysekennzahlen, sichtbaren Nach-Speichern-Hook und Projektquelle.
+    #[test]
+    fn saved_live_recording_is_analyzed_and_attached_to_project() {
+        let controller = AppController::new("Testaufnahme", "DBZS");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "livetab-live-recording-{}-{unique}.wav",
+            std::process::id()
+        ));
+        let sample_rate = 48_000;
+        let samples = (0..sample_rate)
+            .map(|index| {
+                (std::f32::consts::TAU * 440.0 * index as f32 / sample_rate as f32).sin() * 0.3
+            })
+            .collect::<Vec<_>>();
+        let mut saved_info = None;
+        let summary = save_and_analyze_recording(
+            &controller,
+            &path,
+            samples,
+            sample_rate,
+            || false,
+            |waveform, duration, rate| saved_info = Some((waveform, duration, rate)),
+        )
+        .unwrap();
+
+        assert!(path.is_file());
+        assert!(summary.analyzed_frames > 0);
+        assert_eq!(summary.sample_rate, sample_rate);
+        assert!((summary.duration_seconds - 1.0).abs() < 0.01);
+        let (waveform, saved_duration, saved_rate) = saved_info.unwrap();
+        assert!(!waveform.is_empty());
+        assert!((saved_duration - 1.0).abs() < 0.01);
+        assert_eq!(saved_rate, sample_rate);
+        let project = controller.snapshot().unwrap();
+        assert_eq!(project.audio_path.as_deref(), Some(path.as_path()));
+        assert!((project.duration_seconds - 1.0).abs() < 0.01);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Zweck: Verhindert Dateierzeugung und UI-Erfolgsmeldung, wenn der Nutzer vor dem WAV-Schreiben abbricht.
+    /// Eingaben: Keine; nutzt kurze Samples, ein temporäres Ziel und ein bereits gesetztes Abbruchsignal.
+    /// Ausgabe: Keine Rückgabe; erwartet Abbruchfehler, kein WAV und keinen Nach-Speichern-Callback.
+    #[test]
+    fn cancelled_recording_does_not_create_a_wav() {
+        let controller = AppController::new("Abbruchtest", "DBZS");
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "livetab-cancelled-recording-{}-{unique}.wav",
+            std::process::id()
+        ));
+        let mut after_save_called = false;
+        let result = save_and_analyze_recording(
+            &controller,
+            &path,
+            vec![0.0; 4096],
+            48_000,
+            || true,
+            |_, _, _| after_save_called = true,
+        );
+
+        assert!(result.unwrap_err().contains("abgebrochen"));
+        assert!(!path.exists());
+        assert!(!after_save_called);
+    }
 }

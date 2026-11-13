@@ -38,7 +38,9 @@ Die ursprünglichen Projektpapiere und das UI-Konzept bleiben unverändert erhal
 - [ ] VRAM automatisch ermitteln und GPU-Layerlast daran ausrichten; derzeit bleibt der CUDA-Standard vorsichtig bei 8 Layern, Messprofile werden explizit über `LIVETAB_GPU_LAYERS` gesetzt.
 - [ ] Releasepaket mit passender Runtime-/CUDA-DLL-Auswahl und SHA-256-Prüfung für das Modell erzeugen.
 - [ ] Android-/iOS-Builds auf geeigneter Toolchain und echten Zielgeräten prüfen.
-- [ ] WASAPI-Liveaufnahme, vollständige Audioanalyse-/Playback-Pipeline und Control Desk implementieren; Audio-Latenz ist noch nicht gemessen.
+- [x] Windows-WASAPI-Loopback-Capture, lokaler Live-DSP sowie automatische lokale Rust-DSP-Analyse und Vier-Stem-Trennung gespeicherter Liveaufnahmen; fehlende Stem-Modelle erfordern eine ausdrückliche Downloadfreigabe.
+- [ ] Live-Pitch-/Beat-Ausbau und Control Desk implementieren; echte WASAPI-Geräte-/GUI-Laufzeit und Audio-Latenz sind noch nicht gemessen.
+- [x] Separaten ASIO-Interfaceeingang über die MIT-lizenzierte Rust-Crate `azo` integrieren; getrennt von WASAPI-Systemmix. Vollständiger Windows-x64-GNU-Appbuild (`cargo check` und `cargo build`) wurde im Linux-Sandbox-Crossbuild erfolgreich verifiziert; reale Treiber-/Geräteprüfung bleibt offen. Details: `WINDOWS_CROSS_BUILD_STATUS.md`.
 
 ## Quellen
 
