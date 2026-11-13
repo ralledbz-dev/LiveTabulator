@@ -29,12 +29,12 @@ Dokumentationspflicht:
 
 ## Ziel
 
-Die Audio Pipeline nimmt den Windows-Stereo-Ausgang auf, erzeugt stabile Analyseframes und stellt diese Live-Analyse, Deep-Analyse und Aufnahmefunktion bereit.
+Die Audio Pipeline führt lokale Eingänge zu stabilen Analyseframes zusammen. Unter Windows bleiben die Quellen getrennt: WASAPI-Loopback nimmt den Systemmix eines Render-Endpunkts auf, ASIO liest Eingänge eines registrierten Audiointerfaces. ASIO ist kein Ersatz für Systemton-Loopback. Android/iOS verwenden eine freigegebene Mikrofoneingabe.
 
 ## Kernpipeline
 
 ```text
-WASAPI Loopback
+WASAPI Systemmix oder ASIO-Interfaceeingang
 → AudioCaptureService
 → AudioRingBuffer
 → FrameSplitter
@@ -47,12 +47,12 @@ WASAPI Loopback
 
 ### Zweck
 
-Startet und stoppt die Aufnahme des Windows-Systemausgangs.
+Startet und stoppt die jeweils gewählte lokale Audioquelle. Unter Windows wird WASAPI-Loopback für den Systemmix oder ASIO für Interface-Eingänge verwendet.
 
 ### Verantwortlichkeiten
 
-- Audioausgabegeräte auflisten
-- WASAPI Loopback initialisieren
+- WASAPI-Render-Endpunkte und ASIO-Treiber getrennt auflisten
+- den gewählten Backendpfad initialisieren (WASAPI-Loopback oder ASIO-Interfaceeingang)
 - Sample Rate und Kanalzahl erfassen
 - Pegelwerte berechnen
 - Frames an den Ringbuffer senden

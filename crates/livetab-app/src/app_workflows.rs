@@ -145,7 +145,14 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
                     Ok(names) => {
                         let model = slint::ModelRc::new(std::rc::Rc::new(slint::VecModel::from(names.iter().cloned().map(slint::SharedString::from).collect::<Vec<_>>())));
                         handle.set_audio_device_names(model);
-                        handle.set_audio_device_status_text(format!("{} lokale Quelle(n) verfügbar; Auswahl gilt beim nächsten Live-Start.", names.len()).into());
+                        let status = if cfg!(windows) {
+                            let wasapi_count = names.iter().filter(|name| name.starts_with("WASAPI · ")).count();
+                            let asio_count = names.iter().filter(|name| name.starts_with("ASIO · ")).count();
+                            format!("{wasapi_count} WASAPI-Systemmixquelle(n) · {asio_count} ASIO-Treiber; Auswahl gilt beim nächsten Live-Start.")
+                        } else {
+                            format!("{} lokale Quelle(n) verfügbar; Auswahl gilt beim nächsten Live-Start.", names.len())
+                        };
+                        handle.set_audio_device_status_text(status.into());
                     }
                     Err(error) => handle.set_audio_device_status_text(error.into()),
                 });
@@ -295,7 +302,7 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
             let path_for_ui = path.clone();
             let recording_wav_saved = Arc::clone(&recording_wav_saved);
             let job = manager.start(JobKind::DeepAnalysis, move |reporter, cancellation| {
-                reporter.progress(0.05, "Live-Systemaudio wird als lokale Mono-WAV gespeichert");
+                reporter.progress(0.05, "Live-Audio wird als lokale Mono-WAV gespeichert");
                 let saved_path_for_ui = path.clone();
                 let save_reporter = reporter.clone();
                 let summary = save_and_analyze_recording(
@@ -316,7 +323,7 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
                             );
                             handle.set_audio_status_text(
                                 format!(
-                                    "Systemaudio-WAV gesichert · {:.2}s · {rate} Hz · Offline-Analyse läuft",
+                                    "Live-Audio-WAV gesichert · {:.2}s · {rate} Hz · Offline-Analyse läuft",
                                     duration_seconds
                                 )
                                 .into(),
@@ -341,7 +348,7 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
                     );
                     handle.set_audio_status_text(
                         format!(
-                            "Systemaudio analysiert · {:.2}s · {} Hz · {} Akkorde · {} Noten",
+                            "Live-Audio analysiert · {:.2}s · {} Hz · {} Akkorde · {} Noten",
                             summary.duration_seconds,
                             summary.sample_rate,
                             summary.chord_count,
@@ -351,7 +358,7 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
                     );
                     update_project_view(&handle, &analysis_controller);
                 });
-                reporter.progress(1.0, "Systemaudio-WAV gespeichert und offline analysiert");
+                reporter.progress(1.0, "Live-Audio-WAV gespeichert und offline analysiert");
                 Ok(message)
             });
             if let Ok(mut active) = deep_job.lock() {
@@ -1053,7 +1060,7 @@ struct RecordingAnalysisSummary {
     analyzed_frames: usize,
 }
 
-/// Zweck: Speichert erfasste Live-Systemaudiosamples als lokale WAV und startet direkt die vollständige Rust-DSP-Analyse.
+/// Zweck: Speichert erfasste Live-Audiosamples beliebiger lokaler Quellen als WAV und startet die vollständige Rust-DSP-Analyse.
 /// Eingaben: Controller, WAV-Ziel, besessene Mono-Samples, Sample-Rate, kooperative Abfrage und Callback nach erfolgreichem Schreiben.
 /// Ausgabe: Analysekennzahlen oder ein Schreib-, Kurzsignal-, Datei- oder Abbruchfehler; gespeicherte WAV bleibt bei Analysefehlern erhalten.
 fn save_and_analyze_recording<F, S>(
