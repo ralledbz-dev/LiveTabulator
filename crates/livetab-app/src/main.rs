@@ -32,6 +32,15 @@ type ModelCatalog = Arc<Mutex<Option<RegistrySnapshot>>>;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ui = MainWindow::new()?;
     ui.set_bandmap_file_picker_available(cfg!(windows));
+    ui.set_auto_stem_after_recording_available(cfg!(windows));
+    ui.set_stem_status_text(
+        if cfg!(windows) {
+            "Vier-Stem-Trennung bereit; gespeicherte Windows-Liveaufnahmen starten sie nach der DSP-Analyse automatisch."
+        } else {
+            "Vier-Stem-Trennung ist bereit; automatische Liveaufnahme-Trennung ist nur im Windows-Build verfügbar."
+        }
+        .into(),
+    );
     let app_models_dir = app_models_directory();
     let current_model: ModelPathState = Arc::new(Mutex::new(None));
     let runtime_state: RuntimeState = Arc::new(Mutex::new(None));
