@@ -40,7 +40,7 @@ Die ursprünglichen Projektpapiere und das UI-Konzept bleiben unverändert erhal
 - [ ] Android-/iOS-Builds auf geeigneter Toolchain und echten Zielgeräten prüfen.
 - [x] Windows-WASAPI-Loopback-Capture, lokaler Live-DSP sowie automatische lokale Rust-DSP-Analyse und Vier-Stem-Trennung gespeicherter Liveaufnahmen; fehlende Stem-Modelle erfordern eine ausdrückliche Downloadfreigabe.
 - [ ] Live-Pitch-/Beat-Ausbau und Control Desk implementieren; echte WASAPI-Geräte-/GUI-Laufzeit und Audio-Latenz sind noch nicht gemessen.
-- [ ] ASIO-Backend für kompatible Windows-Audiointerfaces ergänzen; getrennt vom WASAPI-Systemloopback planen und vor SDK-Integration Lizenz-/Verteilungsweg klären.
+- [x] Separaten ASIO-Interfaceeingang über die MIT-lizenzierte Rust-Crate `azo` integrieren; getrennt von WASAPI-Systemmix. Vollständiger Windows-App-Compile und reale Treiber-/Geräteprüfung sind noch offen.
 
 ## Quellen
 
@@ -134,3 +134,11 @@ Frühere Windows-Ergebnisse auf RAZOR; Cargo-Abhängigkeiten wurden offline und 
 - `python3 -m unittest -v crates/livetab-core/workers/test_stem_worker.py`: **6 bestanden**; `py_compile` für Worker und Tests bestanden. Diese Tests prüfen das Freigabegate und das Vier-Stem-Mapping isoliert, nicht die tatsächliche Modellausführung in der App.
 - **Nicht verifiziert:** echte WASAPI-Geräteaufnahme und Windows-GUI-Laufzeit, YouTube-/Systemton über ein reales Ausgabegerät, Capturelatenz, Audioqualität und tatsächliche Modellgewichte-/Stem-Ausführung im App-Python. Der Linux-Build kompiliert nicht den Windows-`wasapi`-Zweig. Android/iOS bleiben Mikrofonaufnahme statt Systemloopback; Linux-Desktop meldet den fehlenden lokalen Captureadapter.
 - Umsetzungsplan: `IMPLEMENTIERUNGSPLAN_2_SYSTEMAUDIO.md`. Kein Commit erstellt und nichts gepusht.
+
+## Separater ASIO-Interfaceeingang — Stand 2026-11-13
+
+- Die Windows-Quellliste zeigt `ASIO ·`-Treiber getrennt von `WASAPI ·`-Renderendpunkten. ASIO öffnet den Interface-Treiber auf einem eigenen Capturethread; WASAPI-Loopback bleibt der Systemmixpfad. Beide speisen den bestehenden Live-DSP- und Mono-WAV-/Analyseworkflow.
+- Adapter: `crates/livetab-app/src/asio_capture.rs`; `azo` 0.6.1 (MIT, direkter Treiberzugriff ohne das Steinberg-SDK). Der Treibercallback übergibt Bufferwechsel über einen begrenzten, nicht blockierenden Kanal; Konvertierung und DSP laufen im Worker. Der erste Eingangskanal beziehungsweise das erste Eingangspaar wird unterstützt; übliche lineare PCM-/Floatformate werden konvertiert.
+- `cargo check --locked -p livetab-app`: **bestanden** unter Linux; Windows-`cfg` wird dadurch nicht mitkompiliert. `cargo test --locked --workspace`: **bestanden** — App 16 bestanden, 0 fehlgeschlagen, 3 ignoriert; Core 58 bestanden, 0 fehlgeschlagen.
+- Ein isolierter `x86_64-pc-windows-gnu`-Zielcompile der produktiven `asio_capture.rs`- und `audio_capture.rs`-Module mit `azo`, `crossbeam-channel`, `cpal`, `wasapi` und `livetab-core` bestand; `--tests` typprüfte auch den ASIO-Testcode, führte ihn aber nicht aus. Der vollständige `cargo check --target x86_64-pc-windows-gnu -p livetab-app` stoppte vorher im bestehenden `llama-cpp-sys-4`-Buildscript: Clang konnte `stdbool.h` in der Sandbox-MinGW-Konfiguration nicht finden; der App-Windows-Build wurde daher nicht bestätigt.
+- **Nicht verifiziert:** Treiberscan und Echtaufnahme mit echtem installierten ASIO-Treiber/Interface, Windows-GUI, Audioqualität, Bufferverluste oder reale Latenz. Keine Hardwaremesswerte wurden erhoben. Details und Quellen stehen im `IMPLEMENTIERUNGSPLAN_2_SYSTEMAUDIO.md`. Kein Commit erstellt und nichts gepusht.

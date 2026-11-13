@@ -24,7 +24,7 @@ export component MainWindow inherits Window {
 
     in-out property <string> status_text: "Bereit · lokale Verarbeitung";
     in-out property <string> audio_status_text: "Keine Audioquelle ausgewählt.";
-    in-out property <string> audio_device_status_text: "Audioendpunkte noch nicht aufgelistet.";
+    in-out property <string> audio_device_status_text: "WASAPI = Systemmix · ASIO = Interfaceeingang (kein Systemton).";
     in-out property <[string]> audio_device_names: [];
     in-out property <string> worker_status_text: "Analyse-Worker bereit";
     in-out property <string> current_chord_text: "—";
@@ -91,8 +91,8 @@ export component MainWindow inherits Window {
     // Eingaben: Keine; Geräteauswahl und Berechtigungen werden vom Backend verwaltet.
     // Ausgabe: Kein Rückgabewert; signalisiert den Startwunsch an den Audio-Service.
     callback start_live_requested();
-    // Zweck: Lädt die aktiven Windows-Render-Endpunkte oder die plattformnative lokale Eingabe.
-    // Eingaben: Keine; die Auflistung läuft auf einem separaten COM-/Audio-Worker.
+    // Zweck: Lädt Windows-WASAPI-Systemmixquellen und ASIO-Interfaceeingänge oder die plattformnative lokale Eingabe.
+    // Eingaben: Keine; die Auflistung läuft auf einem separaten Geräte-/Treiberworker.
     // Ausgabe: Kein Rückgabewert; verfügbare Geräte werden dem ComboBox-Modell übergeben.
     callback scan_audio_devices_requested();
     // Zweck: Übernimmt die vom Nutzer gewählte Audioquelle für den nächsten Live-Start.
@@ -319,7 +319,7 @@ export component MainWindow inherits Window {
                                 selected(value) => { root.audio_device_selected(value); }
                             }
                             Button {
-                                text: "Geräte"; enabled: !root.live_running;
+                                text: "Quellen"; enabled: !root.live_running;
                                 // Zweck: Lädt die verfügbaren lokalen Audioquellen.
                                 // Eingaben: Mausklick.
                                 // Ausgabe: Kein Rückgabewert; die Geräte erscheinen im Auswahlfeld.

@@ -44,14 +44,19 @@ Die App zeichnet den ausgewählten WASAPI-Render-Endpunkt auf. Das ist der Syste
 Die Änderungen liegen lokal im bestehenden Arbeitszweig. Es wurde kein Commit erstellt und nichts gepusht.
 
 
-## ASIO – separater offener Windows-Audiopfad
+## ASIO – separater Windows-Interfaceeingang (umgesetzt)
 
-ASIO wird als eigener Backend-Schritt für ASIO-fähige Audiointerfaces und deren niedrige Latenz vorgemerkt. Es ersetzt WASAPI-Loopback nicht: Für den Systemmix eines Render-Endpunkts bleibt WASAPI-Loopback der passende Pfad; ASIO zielt auf Interface-Ein-/Ausgabe und ist keine allgemeine „YouTube-Systemaudio“-Quelle. In diesem Slice wurde ASIO **nicht** implementiert und es wird keine Unterstützung behauptet.
+ASIO ist als eigene Windows-Quelle neben WASAPI integriert. Der Quellwähler markiert Einträge mit `ASIO ·` beziehungsweise `WASAPI ·`: WASAPI bleibt der vorhandene Loopback-Pfad für den Systemmix eines Render-Endpunkts; ASIO erfasst Eingänge eines registrierten ASIO-Audiointerfaces und ist keine allgemeine „YouTube-Systemaudio“-Quelle. Die voreingestellte Auswahl bleibt WASAPI-Standardausgabe.
 
-Vor einer ASIO-SDK-Integration ist eine Lizenzentscheidung nötig. Steinbergs aktuelle Entwicklerseite nennt die offene ASIO-Variante GPLv3 und führt außerdem eine proprietäre Lizenzvariante auf. Da das LiveTabulator-Repository als MIT lizenziert ist, wird keine SDK-/Lizenzwahl stillschweigend getroffen; vor Einbindung oder Weitergabe sind Lizenzkompatibilität und Verteilungsweg zu klären.
+`crates/livetab-app/src/asio_capture.rs` verwendet `azo` 0.6.1 direkt. `azo` veröffentlicht eine MIT-Lizenz und greift laut Projektbeschreibung ohne Steinberg-ASIO-SDK auf die COM-Objekte registrierter Treiber zu. Die Echtzeitcallbacks stellen Bufferwechsel über einen begrenzten, nicht blockierenden Kanal an den Captureworker zu; Samplekonvertierung, Mono-Mischung, bestehende DSP-Pipeline und WAV-Aufnahme laufen außerhalb des Treibercallbacks. Erfasst werden der erste Eingangskanal beziehungsweise das erste Eingangspaar; unterstützte lineare PCM-Formate werden in Float umgewandelt. Der Treiber wird auf einem eigenen Capturethread geöffnet, initialisiert, gestartet, gestoppt und freigegeben.
+
+Diese Umsetzung bindet weder das Steinberg-ASIO-SDK noch `asio-sys` ein. Damit wird für den neuen ASIO-Pfad keine GPLv3-SDK-Integration in das MIT-Projekt vorgenommen; Steinbergs separate proprietäre SDK-Lizenz wird ebenfalls nicht benutzt. Die Aufnahme eines echten Treibers/Geräts und die gerätespezifischen Treiberbedingungen bleiben dennoch gesondert zu prüfen.
+
+**Verifikation:** `asio_capture.rs` und `audio_capture.rs` bestanden gemeinsam einen isolierten `x86_64-pc-windows-gnu`-Zielcompile mit `azo`, `crossbeam-channel`, `cpal`, `wasapi` und dem Rust-Core; `--tests` typprüfte außerdem den ASIO-Testcode, führte ihn aber nicht aus. Der vollständige App-Windows-Compile konnte wegen des vorhandenen `llama-cpp-sys-4`-Buildscripts nicht bis zur App gelangen: Clang findet `stdbool.h` in der Sandbox-MinGW-Zielkonfiguration nicht. Linux-Appbuild und Workspace-Tests bestanden; Linux allein kompiliert den Windows-Zweig nicht. **Nicht geprüft:** ASIO-Laufzeit mit echtem Treiber/Interface, Windows-GUI, tatsächliche Latenz oder Audioqualität.
 
 ## Technische Referenzen
 
 - [Microsoft: WASAPI Loopback Recording](https://learn.microsoft.com/en-us/windows/win32/coreaudio/loopback-recording) – beschreibt Capture des auf einem Render-Endpunkt wiedergegebenen Systemmixes im Shared Mode.
 - [wasapi 0.26.0: `AudioClient`](https://docs.rs/wasapi/0.26.0/wasapi/struct.AudioClient.html) – dokumentiert Render-Endpunkt plus Capture-Richtung; die gepinnte Crate-Quelle setzt für `(Render, Capture, Shared)` `AUDCLNT_STREAMFLAGS_LOOPBACK`.
 - [Steinberg: ASIO Open-Source-Lizenz](https://www.steinberg.net/developers/asiosdk-open/) und [proprietäre SDK-Lizenzinformationen](https://www.steinberg.net/developers/prorietary-sdk/) – Grundlage für die offene Lizenz-/Distributionsentscheidung.
+- [`azo` 0.6.1 auf docs.rs](https://docs.rs/azo/0.6.1/azo/) und [LastExceed/azo](https://github.com/LastExceed/azo) – MIT-Metadaten, Treiber-API sowie ausdrückliche Abgrenzung zur Steinberg-SDK-Wrappercrate.

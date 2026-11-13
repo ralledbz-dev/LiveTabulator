@@ -1,4 +1,6 @@
 mod app_workflows;
+#[cfg(windows)]
+mod asio_capture;
 mod audio_capture;
 mod llama_runtime;
 mod playback_output;
