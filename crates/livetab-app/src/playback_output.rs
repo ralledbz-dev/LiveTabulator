@@ -17,6 +17,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::thread;
 use std::time::Duration;
 
+/// Höchstbudget für f32-Samples aller parallel verfügbaren synchronen WAV-Quellen.
+const MAX_SYNCHRONIZED_DECODED_BYTES: usize = 768 * 1024 * 1024;
+
 /// Laufende native Wiedergabe, steuerbar ohne Zugriff auf den plattformspezifischen Stream.
 pub struct PlaybackOutputSession {
     state: Arc<PlaybackState>,
@@ -24,14 +27,56 @@ pub struct PlaybackOutputSession {
 }
 
 impl PlaybackOutputSession {
-    /// Zweck: Öffnet den Standardausgang auf einem Workerthread und startet die PCM-Wiedergabe.
+    /// Zweck: Öffnet den Standardausgang für eine einzelne lokale WAV-Quelle.
     /// Eingaben: Dekodierte lokale WAV-Datei; Ausgabegerät/-format stammen vom Audiohost.
     /// Ausgabe: Kontrollhandle oder ein klarer Geräte-/Format-/Streamfehler.
     pub fn start(wave: WaveFile) -> Result<Self, String> {
-        if wave.format.sample_rate == 0 || wave.format.channels == 0 || wave.frame_count() == 0 {
-            return Err("Playback-WAV muss mindestens einen gültigen Audioframe enthalten.".into());
+        Self::start_sources(vec![("source".into(), wave)], "source")
+    }
+
+    /// Zweck: Startet einen nativen Stream mit umschaltbaren, zeitlich ausgerichteten WAV-Quellen.
+    /// Eingaben: `(id, WAV)`-Quellen und die anfänglich aktive ID; maximal sechs Quellen.
+    /// Ausgabe: Kontrollhandle oder ein Validierungs-/Geräte-/Streamfehler.
+    pub fn start_sources(
+        sources: Vec<(String, WaveFile)>,
+        initial_source_id: &str,
+    ) -> Result<Self, String> {
+        if sources.is_empty() || sources.len() > 6 {
+            return Err("Playback benötigt eine bis sechs WAV-Quellen.".into());
         }
-        let state = Arc::new(PlaybackState::new(wave));
+        let decoded_bytes = sources.iter().fold(0usize, |total, (_, wave)| {
+            total.saturating_add(
+                wave.samples
+                    .len()
+                    .saturating_mul(std::mem::size_of::<f32>()),
+            )
+        });
+        validate_multitrack_buffer_budget(sources.len(), decoded_bytes)?;
+        let mut ids = std::collections::HashSet::new();
+        let mut durations = Vec::with_capacity(sources.len());
+        let mut active_index = None;
+        for (index, (id, wave)) in sources.iter().enumerate() {
+            if id.is_empty() || !ids.insert(id.clone()) {
+                return Err("Playback-Quellen benötigen eindeutige IDs.".into());
+            }
+            if wave.format.sample_rate == 0 || wave.format.channels == 0 || wave.frame_count() == 0
+            {
+                return Err(format!("Playback-WAV `{id}` ist leer oder ungültig."));
+            }
+            durations.push(wave.duration_seconds());
+            if id == initial_source_id {
+                active_index = Some(index);
+            }
+        }
+        if durations
+            .iter()
+            .any(|duration| (*duration - durations[0]).abs() > 0.020)
+        {
+            return Err("Playback-Quellen sind nicht innerhalb von 20 ms synchronisiert.".into());
+        }
+        let active_index =
+            active_index.ok_or_else(|| format!("Playback-Quelle `{initial_source_id}` fehlt."))?;
+        let state = Arc::new(PlaybackState::new_sources(sources, active_index));
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_state = Arc::clone(&state);
         let worker_shutdown = Arc::clone(&shutdown);
@@ -64,6 +109,13 @@ impl PlaybackOutputSession {
             }
         }
         Ok(Self { state, shutdown })
+    }
+
+    /// Zweck: Wechselt auf eine dekodierte Original- oder Stem-WAV, ohne den Playhead zurückzusetzen.
+    /// Eingaben: `source_id` – stabile Projektkennung der gewünschten Quelle.
+    /// Ausgabe: `Ok(())` bei geladener Quelle oder ein Auswahlfehler.
+    pub fn select_source(&self, source_id: &str) -> Result<(), String> {
+        self.state.select_source(source_id)
     }
 
     /// Zweck: Setzt die Wiedergabe auf Pause, erhält aber die aktuelle Audioausgabeposition.
@@ -172,7 +224,8 @@ impl Drop for PlaybackOutputSession {
 }
 
 struct PlaybackState {
-    wave: Arc<WaveFile>,
+    sources: Vec<PlaybackSource>,
+    active_source_index: AtomicUsize,
     position_bits: AtomicU64,
     loop_start_bits: AtomicU64,
     loop_end_bits: AtomicU64,
@@ -183,13 +236,32 @@ struct PlaybackState {
     playing: AtomicBool,
 }
 
+struct PlaybackSource {
+    id: String,
+    wave: Arc<WaveFile>,
+}
+
 impl PlaybackState {
     /// Zweck: Erstellt den atomaren Audiozustand mit pausierter Ausgabe und deaktiviertem Metronom.
     /// Eingaben: Validierte WAV-Quelle.
     /// Ausgabe: Thread-sicherer Zustand für das native Audiogerät.
     fn new(wave: WaveFile) -> Self {
+        Self::new_sources(vec![("source".into(), wave)], 0)
+    }
+
+    /// Zweck: Erstellt den atomaren Zustand aus einer Quellenliste und einem gültigen Index.
+    /// Eingaben: `(id, WAV)`-Quellen sowie Index der anfänglich aktiven WAV.
+    /// Ausgabe: Pausierter Playbackzustand mit gemeinsamem Zeit-/Loop-/Tempo-Cursor.
+    fn new_sources(sources: Vec<(String, WaveFile)>, active_source_index: usize) -> Self {
         Self {
-            wave: Arc::new(wave),
+            sources: sources
+                .into_iter()
+                .map(|(id, wave)| PlaybackSource {
+                    id,
+                    wave: Arc::new(wave),
+                })
+                .collect(),
+            active_source_index: AtomicUsize::new(active_source_index),
             position_bits: AtomicU64::new(0.0f64.to_bits()),
             loop_start_bits: AtomicU64::new(0.0f64.to_bits()),
             loop_end_bits: AtomicU64::new(0.0f64.to_bits()),
@@ -205,7 +277,23 @@ impl PlaybackState {
     /// Eingaben: `self` – immutable WAV-Quelle.
     /// Ausgabe: Positive oder nichtnegative Dauer in Sekunden.
     fn duration_seconds(&self) -> f64 {
-        self.wave.duration_seconds()
+        self.sources
+            .get(self.active_source_index.load(Ordering::Acquire))
+            .map(|source| source.wave.duration_seconds())
+            .unwrap_or(0.0)
+    }
+
+    /// Zweck: Wählt eine bereits dekodierte Quelle und erhält die gemeinsame Audiozeit.
+    /// Eingaben: `id` – Original- oder Stem-Kennung.
+    /// Ausgabe: `Ok(())` bei vorhandenem Buffer oder ein Fehler bei unbekannter Kennung.
+    fn select_source(&self, id: &str) -> Result<(), String> {
+        let index = self
+            .sources
+            .iter()
+            .position(|source| source.id == id)
+            .ok_or_else(|| format!("Playback-Quelle `{id}` ist nicht geladen."))?;
+        self.active_source_index.store(index, Ordering::Release);
+        Ok(())
     }
 
     /// Zweck: Rendert einen einzelnen Outputkanal und verschiebt die Audiozeit einmal pro Outputframe.
@@ -232,9 +320,14 @@ impl PlaybackState {
                 .store(duration.to_bits(), Ordering::Release);
             return 0.0;
         }
-        let channels = usize::from(self.wave.format.channels);
-        let frames = self.wave.frame_count();
-        let source_position = position * f64::from(self.wave.format.sample_rate);
+        let source = self
+            .sources
+            .get(self.active_source_index.load(Ordering::Acquire))
+            .unwrap_or(&self.sources[0]);
+        let wave = &source.wave;
+        let channels = usize::from(wave.format.channels);
+        let frames = wave.frame_count();
+        let source_position = position * f64::from(wave.format.sample_rate);
         let left_index = (source_position.floor() as usize).min(frames.saturating_sub(1));
         let right_index = (left_index + 1).min(frames.saturating_sub(1));
         let fraction = (source_position - left_index as f64) as f32;
@@ -242,7 +335,7 @@ impl PlaybackState {
         if output_channels == 1 && channels > 1 {
             for channel in 0..channels {
                 original += interpolate_sample(
-                    &self.wave.samples,
+                    &wave.samples,
                     channels,
                     left_index,
                     right_index,
@@ -258,7 +351,7 @@ impl PlaybackState {
                 output_channel.min(channels - 1)
             };
             original = interpolate_sample(
-                &self.wave.samples,
+                &wave.samples,
                 channels,
                 left_index,
                 right_index,
@@ -328,6 +421,22 @@ fn interpolate_sample(
         .copied()
         .unwrap_or(first);
     first + (second - first) * fraction.clamp(0.0, 1.0)
+}
+
+/// Zweck: Verhindert, dass synchronisierte WAV-Quellen einen unbegrenzten f32-Puffer anlegen.
+/// Eingaben: `source_count` – Anzahl parallel geladener WAVs; `decoded_bytes` – deren Sample-Speicher.
+/// Ausgabe: `Ok(())` innerhalb des Budgets oder eine klare Meldung bei zu großem Mehrspurset.
+fn validate_multitrack_buffer_budget(
+    source_count: usize,
+    decoded_bytes: usize,
+) -> Result<(), String> {
+    if source_count > 1 && decoded_bytes > MAX_SYNCHRONIZED_DECODED_BYTES {
+        return Err(
+            "Original und Stem-WAVs benötigen zusammen mehr als 768 MiB Audiospeicher; laden Sie kürzere oder weniger Quellen."
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// Zweck: Öffnet und hält den nativen Standardausgabestream, bis das Handle beendet wird.
@@ -512,5 +621,44 @@ mod tests {
         assert!((state.render_frame(1000, 2, 0) - 0.25).abs() < 1e-6);
         assert!((state.render_frame(1000, 2, 1) + 0.5).abs() < 1e-6);
         assert!((f64::from_bits(state.position_bits.load(Ordering::Acquire)) - 0.001).abs() < 1e-9);
+    }
+
+    /// Zweck: Prüft Quellenwechsel zwischen Original und Stem bei erhaltenem gemeinsamem Playhead.
+    /// Eingaben: Keine; beide künstlichen Mono-WAVs haben identische Zeit- und Formatmetadaten.
+    /// Ausgabe: Keine; der Cursor bleibt beim Wechsel erhalten und die neue Quelle wird hörbar.
+    #[test]
+    fn source_switch_preserves_shared_playhead() {
+        let stem = WaveFile {
+            format: AudioFormat {
+                sample_rate: 1000,
+                channels: 1,
+                bits_per_sample: 32,
+                is_float: true,
+            },
+            samples: vec![0.9, 0.75, 0.5, 0.25],
+        };
+        let state = PlaybackState::new_sources(
+            vec![("source".into(), test_wave()), ("stem-vocals".into(), stem)],
+            0,
+        );
+        state.metronome_enabled.store(false, Ordering::Release);
+        state.playing.store(true, Ordering::Release);
+        assert!((state.render_frame(1000, 1, 0) - 0.25).abs() < 1e-6);
+        let before_switch = state.position_bits.load(Ordering::Acquire);
+        state.select_source("stem-vocals").unwrap();
+        assert_eq!(state.position_bits.load(Ordering::Acquire), before_switch);
+        assert!((state.render_frame(1000, 1, 0) - 0.75).abs() < 1e-6);
+        assert!((f64::from_bits(state.position_bits.load(Ordering::Acquire)) - 0.002).abs() < 1e-9);
+        assert!(state.select_source("stem-missing").is_err());
+    }
+
+    /// Zweck: Prüft die Speichergrenze für mehrere dekodierte Playbackquellen ohne große Allokation.
+    /// Eingaben: Keine; verwendet nur Grenzwerte der Validierungsfunktion.
+    /// Ausgabe: Keine; Einzeltracks bleiben unberührt und übergroße Mehrspursets werden abgelehnt.
+    #[test]
+    fn multitrack_buffer_budget_is_bounded() {
+        assert!(validate_multitrack_buffer_budget(5, MAX_SYNCHRONIZED_DECODED_BYTES).is_ok());
+        assert!(validate_multitrack_buffer_budget(5, MAX_SYNCHRONIZED_DECODED_BYTES + 1).is_err());
+        assert!(validate_multitrack_buffer_budget(1, MAX_SYNCHRONIZED_DECODED_BYTES + 1).is_ok());
     }
 }

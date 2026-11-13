@@ -21,7 +21,7 @@ use crate::lyrics::{LyricsBackend, align_transcription_with_language};
 use crate::music::analyze_chroma;
 use crate::observability::{LogCategory, LogLevel, Observer};
 use crate::playback::{PlaybackScheduler, PlaybackTick};
-use crate::project_model::{BeatEvent, GuitarTuning, SongProject};
+use crate::project_model::{BeatEvent, GuitarTuning, SongProject, StemTrack};
 use crate::song::{ChordEvent, LyricsWord, NoteEvent};
 use crate::tab_engine::generate_tab_track;
 use std::collections::BTreeMap;
@@ -145,6 +145,26 @@ impl AppController {
             wave.format.sample_rate,
             wave.format.channels
         ));
+        Ok(())
+    }
+
+    /// Zweck: Validiert und übernimmt das vollständige Ergebnis der lokalen Stem-Trennung.
+    /// Eingaben: `tracks` – synchronisierte, bereits als WAV geprüfte Stem-Metadaten.
+    /// Ausgabe: `Ok(())` nach Projektaktualisierung oder ein Validierungs-/Sperrfehler.
+    pub fn replace_stem_tracks(&self, tracks: Vec<StemTrack>) -> Result<(), String> {
+        let mut project = self
+            .project
+            .lock()
+            .map_err(|_| "Songprojekt konnte nicht gesperrt werden.".to_string())?;
+        project.replace_stem_tracks(tracks)?;
+        self.observer.log(
+            LogLevel::Info,
+            LogCategory::Audio,
+            "Stem-Trennung abgeschlossen",
+            "Vier lokale WAV-Spuren wurden dem Songprojekt hinzugefügt.",
+            BTreeMap::new(),
+            None,
+        );
         Ok(())
     }
 

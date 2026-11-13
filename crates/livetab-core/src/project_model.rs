@@ -13,6 +13,7 @@ Hinweise:
 use crate::domain::{DomainError, KeySignature, TimeSignature, validate_bpm};
 use crate::song::{ChordEvent, LyricsWord, NoteEvent, TabNote};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -143,6 +144,95 @@ pub struct TabTrack {
     pub generated: bool,
 }
 
+/// Modellklasse einer lokalen Vier-Stem-Ausgabe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StemKind {
+    /// Gesungene oder gesprochene Hauptstimme.
+    Vocals,
+    /// Schlagzeug- und Percussionanteil.
+    Drums,
+    /// Bassinstrumente.
+    Bass,
+    /// Übrige Instrumente des Vier-Stem-Modells.
+    Other,
+}
+
+impl StemKind {
+    /// Zweck: Liefert den deutschen Anzeigenamen der Stem-Klasse.
+    /// Eingaben: `self` – klassifizierte Modellspur.
+    /// Ausgabe: Stabile deutschsprachige Kurzbezeichnung.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Vocals => "Gesang",
+            Self::Drums => "Schlagzeug",
+            Self::Bass => "Bass",
+            Self::Other => "Übrige Instrumente",
+        }
+    }
+}
+
+/// Separat abspielbare, synchronisierte WAV-Spur aus der lokalen Stem-Trennung.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StemTrack {
+    /// Sicherer, projektweit eindeutiger Dateibestandteil.
+    pub id: String,
+    /// Im Mixer angezeigter Spurname.
+    pub name: String,
+    /// Von der Modellkonfiguration gelieferte Spurklasse.
+    pub kind: StemKind,
+    /// Lokaler WAV-Pfad; portable Archive schreiben nur einen kanonischen relativen Namen.
+    pub file_path: PathBuf,
+    /// WAV-Samplerate in Hertz.
+    pub sample_rate: u32,
+    /// Zahl interleavter WAV-Kanäle.
+    pub channels: u16,
+    /// Gemessene Spurzeit in Sekunden.
+    pub duration_seconds: f64,
+    /// Angeforderte Separator-Modellkonfiguration.
+    pub model_filename: String,
+    /// Version des Python-Workers oder des Pakets, falls ermittelt.
+    #[serde(default)]
+    pub model_version: String,
+}
+
+impl StemTrack {
+    /// Zweck: Prüft sichere Kennung, WAV-Metadaten und Modellreferenz einer Stem-Spur.
+    /// Eingaben: `self` – aus Workerantwort oder Projektdatei gelesene Metadaten.
+    /// Ausgabe: `Ok(())` bei plausiblen Werten oder eine konkrete Validierungsmeldung.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.id.is_empty()
+            || self.id.len() > 64
+            || !self
+                .id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err("Stem-Spur-ID darf nur Buchstaben, Ziffern, Bindestrich oder Unterstrich enthalten.".into());
+        }
+        if self.name.trim().is_empty() || self.name.len() > 80 {
+            return Err("Stem-Spurname muss zwischen 1 und 80 Zeichen lang sein.".into());
+        }
+        if !self.duration_seconds.is_finite() || self.duration_seconds <= 0.0 {
+            return Err("Stem-Spurdauer muss endlich und größer null sein.".into());
+        }
+        if !(8_000..=384_000).contains(&self.sample_rate) || !(1..=8).contains(&self.channels) {
+            return Err("Stem-WAV benötigt 8–384 kHz und 1–8 Kanäle.".into());
+        }
+        if self.model_filename.trim().is_empty()
+            || self.model_filename.contains('/')
+            || self.model_filename.contains('\\')
+        {
+            return Err("Stem-Modellreferenz muss ein einfacher Dateiname sein.".into());
+        }
+        if self.file_path.as_os_str().is_empty() {
+            return Err("Stem-WAV benötigt einen lokalen Dateipfad.".into());
+        }
+        Ok(())
+    }
+}
+
 /// Vollständiger editierbarer Songzustand für Analyse, Playback und Export.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -171,6 +261,9 @@ pub struct SongProject {
     pub lyrics_lines: Vec<LyricsLine>,
     /// Gitarren- und weitere Tabspuren.
     pub tab_tracks: Vec<TabTrack>,
+    /// Optionale synchronisierte Audio-Stems; fehlt das Feld in älteren Projekten, ist die Liste leer.
+    #[serde(default)]
+    pub stem_tracks: Vec<StemTrack>,
     /// Beat-Ereignisse einschließlich Downbeats.
     pub beats: Vec<BeatEvent>,
     /// Optionale lokale Audiodatei; portable Exporte betten sie separat ein.
@@ -204,6 +297,7 @@ impl SongProject {
             lyrics_words: Vec::new(),
             lyrics_lines: Vec::new(),
             tab_tracks: Vec::new(),
+            stem_tracks: Vec::new(),
             beats: Vec::new(),
             audio_path: None,
             duration_seconds: 0.0,
@@ -280,6 +374,23 @@ impl SongProject {
         self.touch();
     }
 
+    /// Zweck: Ersetzt alle lokal generierten Stem-Spuren nach Metadaten-/ID-Prüfung.
+    /// Eingaben: `tracks` – vollständiger, synchronisierter Vier-Stem-Satz.
+    /// Ausgabe: `Ok(())` und neue Revision oder Validierungsfehler ohne Projektänderung.
+    pub fn replace_stem_tracks(&mut self, tracks: Vec<StemTrack>) -> Result<(), String> {
+        let mut ids = HashSet::new();
+        for track in &tracks {
+            track.validate()?;
+            if !ids.insert(track.id.as_str()) {
+                return Err("Stem-Spur-IDs müssen innerhalb eines Projekts eindeutig sein.".into());
+            }
+        }
+        self.stem_tracks = tracks;
+        self.recalculate_duration();
+        self.touch();
+        Ok(())
+    }
+
     /// Zweck: Berechnet die längste bekannte Songzeit aus Audio und allen Ereignistypen.
     /// Eingaben: `self` – vollständiger Projektzustand.
     /// Ausgabe: Nichtnegative maximale Endzeit in Sekunden.
@@ -310,12 +421,18 @@ impl SongProject {
             .last()
             .map(|beat| beat.time_seconds)
             .unwrap_or(0.0);
+        let stem_end = self
+            .stem_tracks
+            .iter()
+            .map(|track| track.duration_seconds)
+            .fold(0.0, f64::max);
         self.duration_seconds
             .max(chord_end)
             .max(note_end)
             .max(lyric_end)
             .max(tab_end)
             .max(beat_end)
+            .max(stem_end)
     }
 
     /// Zweck: Prüft das Schema, das Tempo, die Audiodauer und alle untergeordneten Zeitwerte.
@@ -391,6 +508,13 @@ impl SongProject {
                 }
             }
         }
+        let mut stem_ids = HashSet::new();
+        for track in &self.stem_tracks {
+            track.validate()?;
+            if !stem_ids.insert(track.id.as_str()) {
+                return Err("Stem-Spur-IDs müssen innerhalb eines Projekts eindeutig sein.".into());
+            }
+        }
         Ok(())
     }
 
@@ -453,5 +577,60 @@ mod tests {
         let mut invalid = standard;
         invalid.open_midi_low_to_high[1] = 39;
         assert!(invalid.validate().unwrap_err().contains("aufsteigend"));
+    }
+
+    /// Zweck: Sichert die Vier-Stem-Metadatenvalidierung und Dauerfortschreibung ab.
+    /// Eingaben: Keine; verwendet vier synthetische, valide WAV-Metadatensätze.
+    /// Ausgabe: Keine Rückgabe; Assertions prüfen Spurklassen, Dauer und Fehlerfälle.
+    #[test]
+    fn stem_tracks_validate_and_extend_project_duration() {
+        let mut project = SongProject::new("Probe", "DBZS");
+        let tracks = [
+            StemKind::Vocals,
+            StemKind::Drums,
+            StemKind::Bass,
+            StemKind::Other,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| StemTrack {
+            id: format!("stem-{index}"),
+            name: kind.display_name().into(),
+            kind,
+            file_path: PathBuf::from(format!("/tmp/stem-{index}.wav")),
+            sample_rate: 44_100,
+            channels: 2,
+            duration_seconds: 12.0,
+            model_filename: "htdemucs.yaml".into(),
+            model_version: "0.48.0".into(),
+        })
+        .collect::<Vec<_>>();
+        project.replace_stem_tracks(tracks.clone()).unwrap();
+        assert_eq!(project.stem_tracks.len(), 4);
+        assert_eq!(project.calculated_duration_seconds(), 12.0);
+        assert!(project.validate().is_ok());
+
+        let mut invalid = tracks;
+        invalid[0].id = "../escape".into();
+        assert!(
+            project
+                .replace_stem_tracks(invalid)
+                .unwrap_err()
+                .contains("ID")
+        );
+        assert_eq!(project.stem_tracks.len(), 4);
+    }
+
+    /// Zweck: Prüft, dass vor Stem-Spuren gespeicherte Songprojekte ohne das neue optionale Feld weiter lesbar sind.
+    /// Eingaben: Keine; erzeugt Projekt-JSON und entfernt nur `stemTracks`.
+    /// Ausgabe: Keine Rückgabe; Assertions bestätigen leere Stem-Liste und gültiges Altschema.
+    #[test]
+    fn old_project_json_defaults_to_no_stem_tracks() {
+        let project = SongProject::new("Probe", "DBZS");
+        let mut value = serde_json::to_value(project).unwrap();
+        value.as_object_mut().unwrap().remove("stemTracks");
+        let loaded: SongProject = serde_json::from_value(value).unwrap();
+        assert!(loaded.stem_tracks.is_empty());
+        assert!(loaded.validate().is_ok());
     }
 }
