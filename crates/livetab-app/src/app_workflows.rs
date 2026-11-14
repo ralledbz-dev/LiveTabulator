@@ -17,6 +17,7 @@ use crate::playback_output::PlaybackOutputSession;
 use crate::stem_workflow::{self, StemRunContext};
 use crate::{MainWindow, ModelCatalog, application_data_directory};
 use livetab_core::audio::read_audio;
+use livetab_core::dsp::midi_note_name;
 use livetab_core::event_bus::AppEvent;
 use livetab_core::export::load_dbztab;
 use livetab_core::jobs::{JobEvent, JobHandle, JobKind, JobState};
@@ -291,7 +292,7 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
                         .ok_or_else(|| "Live-Capture wurde beendet.".to_string())?
                         .finish_recording()
                 });
-            let (samples, sample_rate) = match recording {
+            let (samples, sample_rate, channels) = match recording {
                 Ok(recording) => recording,
                 Err(error) => {
                     handle.set_status_text(error.into());
@@ -332,6 +333,7 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
                     &path,
                     samples,
                     sample_rate,
+                    channels,
                     format,
                     || cancellation.is_cancelled(),
                     move |waveform, duration_seconds, rate| {
@@ -717,6 +719,64 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
         let weak = ui.as_weak();
         let controller = controller.clone();
         let playback = Arc::clone(&playback);
+        // Zweck: Synchronisiert eine eingegebene Songsekunde zwischen Sampleausgabe und Canonical Scheduler.
+        // Eingaben: Textfeld mit endlicher Zielzeit; bei Schedulerfehler wird die vorherige Sampleposition wiederhergestellt.
+        // Ausgabe: Kein Rückgabewert; meldet Erfolg oder Validierungsfehler an die Statusanzeige.
+        ui.on_seek_playback_requested(move |seconds_text| {
+            let seconds = match seconds_text.trim().parse::<f64>() {
+                Ok(value) => value,
+                Err(_) => {
+                    if let Some(handle) = weak.upgrade() {
+                        handle.set_status_text("Seekposition muss eine Zahl in Sekunden sein.".into());
+                    }
+                    return;
+                }
+            };
+            let previous_output_position = if let Ok(active) = playback.lock() {
+                match active.as_ref() {
+                    Some(session) => {
+                        let previous = session.position_seconds();
+                        match session.seek(seconds) {
+                            Ok(()) => Some(previous),
+                            Err(error) => {
+                                if let Some(handle) = weak.upgrade() {
+                                    handle.set_status_text(error.into());
+                                }
+                                return;
+                            }
+                        }
+                    }
+                    None => None,
+                }
+            } else {
+                if let Some(handle) = weak.upgrade() {
+                    handle.set_status_text("Playback-Ausgabe konnte nicht gesperrt werden.".into());
+                }
+                return;
+            };
+            match controller.seek_playback(seconds) {
+                Ok(_) => {
+                    if let Some(handle) = weak.upgrade() {
+                        handle.set_worker_status_text(format!("Playback-Suche: {seconds:.2}s").into());
+                    }
+                }
+                Err(error) => {
+                    if let (Some(previous), Ok(active)) = (previous_output_position, playback.lock()) {
+                        if let Some(session) = active.as_ref() {
+                            let _ = session.seek(previous);
+                        }
+                    }
+                    if let Some(handle) = weak.upgrade() {
+                        handle.set_status_text(error.into());
+                    }
+                }
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let controller = controller.clone();
+        let playback = Arc::clone(&playback);
         ui.on_loop_changed(move |enabled| {
             let range = if enabled {
                 controller
@@ -1024,6 +1084,32 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
     }
     {
         let weak = ui.as_weak();
+        let controller = controller.clone();
+        ui.on_undo_edit_requested(move || match controller.undo_edit() {
+            Ok(_) => {
+                if let Some(handle) = weak.upgrade() {
+                    handle.set_status_text("Letzte manuelle Projektkorrektur rückgängig gemacht.".into());
+                    update_project_view(&handle, &controller);
+                }
+            }
+            Err(error) => if let Some(handle) = weak.upgrade() { handle.set_status_text(error.into()); },
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let controller = controller.clone();
+        ui.on_redo_edit_requested(move || match controller.redo_edit() {
+            Ok(_) => {
+                if let Some(handle) = weak.upgrade() {
+                    handle.set_status_text("Rückgängig gemachte Projektkorrektur wiederhergestellt.".into());
+                    update_project_view(&handle, &controller);
+                }
+            }
+            Err(error) => if let Some(handle) = weak.upgrade() { handle.set_status_text(error.into()); },
+        });
+    }
+    {
+        let weak = ui.as_weak();
         ui.on_select_path_requested(move |kind| match kind.as_str() {
             "project" => {
                 if let Some(path) = choose_project_open_path() {
@@ -1132,14 +1218,15 @@ struct RecordingAnalysisSummary {
     analyzed_frames: usize,
 }
 
-/// Zweck: Speichert erfasste Live-Audiosamples als WAV oder MP3 und startet die vollständige Rust-DSP-Analyse.
-/// Eingaben: Controller, lokales WAV-/MP3-Ziel, Mono-Samples, Sample-Rate, Abfrage-/Fortschrittscallback und Callback nach dem Schreiben.
+/// Zweck: Speichert erfasste Live-Audiosamples kanalgetreu als WAV oder MP3 und startet die vollständige Rust-DSP-Analyse.
+/// Eingaben: Controller, lokales WAV-/MP3-Ziel, interleaved Samples, Sample-Rate, Kanalzahl, Abfrage-/Fortschrittscallback und Callback nach dem Schreiben.
 /// Ausgabe: Analysekennzahlen oder ein Schreib-, Kurzsignal-, Datei- oder Abbruchfehler; gespeicherte Aufnahme bleibt bei Analysefehlern erhalten.
 fn save_and_analyze_recording<F, S, P>(
     controller: &AppController,
     path: &std::path::Path,
     samples: Vec<f32>,
     sample_rate: u32,
+    channels: u16,
     format: RecordingFormat,
     mut is_cancelled: F,
     after_save: S,
@@ -1150,7 +1237,9 @@ where
     S: FnOnce(String, f64, u32),
     P: FnMut(f32),
 {
-    if sample_rate == 0 || samples.is_empty() {
+    if sample_rate == 0 || samples.is_empty() || !(1..=8).contains(&channels)
+        || samples.len() % usize::from(channels) != 0
+    {
         return Err("Die Liveaufnahme enthält keine gültigen Samples.".into());
     }
     if recording_format(path) != Some(format) {
@@ -1162,9 +1251,14 @@ where
     if is_cancelled() {
         return Err("Aufnahme-Analyse wurde vor dem Speichern abgebrochen.".into());
     }
-    write_recording_audio(path, &samples, sample_rate, &mut progress)?;
-    let duration_seconds = samples.len() as f64 / f64::from(sample_rate);
-    let waveform = livetab_core::dsp::waveform_bars(&samples, 72);
+    write_recording_audio(path, &samples, sample_rate, channels, &mut progress)?;
+    let frame_count = samples.len() / usize::from(channels);
+    let duration_seconds = frame_count as f64 / f64::from(sample_rate);
+    let waveform_samples = samples
+        .chunks_exact(usize::from(channels))
+        .map(|frame| frame.iter().copied().filter(|sample| sample.is_finite()).sum::<f32>() / f32::from(channels))
+        .collect::<Vec<_>>();
+    let waveform = livetab_core::dsp::waveform_bars(&waveform_samples, 72);
     after_save(waveform, duration_seconds, sample_rate);
     drop(samples);
     let result = controller.analyze_audio_file_with_cancel(path, is_cancelled)?;
@@ -1450,6 +1544,30 @@ fn start_event_dispatcher(
                                 format!("RMS {:.3} · Peak {:.3}", rms, peak).into(),
                             );
                         }
+                        AppEvent::LivePitch { time_seconds, midi, frequency_hz, confidence } => {
+                            let text = match midi {
+                                Some(midi) => format!(
+                                    "Live-Pitch {:.2}s · {} · {:.1} Hz · {:.0}%",
+                                    time_seconds, midi_note_name(midi),
+                                    frequency_hz.unwrap_or_default(), confidence * 100.0,
+                                ),
+                                None => format!("{time_seconds:.2}s · kein sicherer Live-Pitch"),
+                            };
+                            handle.set_live_pitch_text(text.into());
+                        }
+                        AppEvent::AudioTransportMetrics {
+                            sample_rate,
+                            channels,
+                            queue_frames,
+                            dropped_frames,
+                            input_frames_seen,
+                        } => {
+                            let queue_ms = queue_frames as f64 * 1_000.0 / f64::from(sample_rate.max(1));
+                            let duration = input_frames_seen as f64 / f64::from(sample_rate.max(1));
+                            handle.set_audio_metrics_text(format!(
+                                "Gemessen: {sample_rate} Hz · {channels} ch · Queue {queue_ms:.1} ms · verworfen {dropped_frames} Frames · Quelle {duration:.1} s"
+                            ).into());
+                        }
                         AppEvent::ChordDetected(event) => {
                             handle.set_current_chord_text(event.chord().name().into());
                             handle.set_chord_correction_text(event.chord().name().into());
@@ -1462,6 +1580,17 @@ fn start_event_dispatcher(
                                 )
                                 .into(),
                             );
+                            update_project_view(&handle, &controller);
+                        }
+                        AppEvent::NoteDetected(_) => update_project_view(&handle, &controller),
+                        AppEvent::LiveKeyCandidates { alternatives, confidence } => {
+                            if !alternatives.is_empty() {
+                                handle.set_scales_text(format!(
+                                    "Live-Tonartkandidaten · {:.0}%: {}",
+                                    confidence * 100.0,
+                                    alternatives.join(" · "),
+                                ).into());
+                            }
                             update_project_view(&handle, &controller);
                         }
                         AppEvent::BeatGridUpdated {
@@ -1789,7 +1918,7 @@ fn start_recording_stem_followup(
 
 /// Zweck: Aktualisiert alle Analyseanzeigen aus einer konsistenten Songprojektkopie.
 /// Eingaben: UI-Handle und Controller-Snapshotquelle.
-/// Ausgabe: Keine; Timeline, Beats, Lyrics, Tabs, Skala und Trackübersicht werden dargestellt.
+/// Ausgabe: Keine; Akkorde, Noten, Beats, Lyrics, Tabs, Skala und Trackübersicht werden dargestellt.
 fn update_project_view(handle: &MainWindow, controller: &AppController) {
     let Ok(project) = controller.snapshot() else {
         return;
@@ -1846,6 +1975,18 @@ fn update_project_view(handle: &MainWindow, controller: &AppController) {
             .join("\n")
     };
     handle.set_chord_timeline_text(timeline.into());
+    handle.set_note_timeline_text(if project.notes.is_empty() {
+        "Noch keine Live-NoteEvents.".into()
+    } else {
+        project.notes.iter().rev().take(80).collect::<Vec<_>>().into_iter().rev()
+            .map(|note| format!(
+                "{:>6.2}s  {:<5}  {:>5.2}s  {:>3.0}%",
+                note.start_seconds(), midi_note_name(note.midi()), note.duration_seconds(),
+                note.confidence() * 100.0,
+            ))
+            .collect::<Vec<_>>()
+            .join("\n").into()
+    });
     handle.set_beatgrid_text(if project.beats.is_empty() {
         "Beatgrid noch nicht berechnet.".into()
     } else {
@@ -2274,6 +2415,7 @@ mod recording_workflow_tests {
             &path,
             samples,
             sample_rate,
+            1,
             RecordingFormat::Wav,
             || false,
             |waveform, duration, rate| saved_info = Some((waveform, duration, rate)),
@@ -2315,6 +2457,7 @@ mod recording_workflow_tests {
             &path,
             vec![0.0; 4096],
             48_000,
+            1,
             RecordingFormat::Wav,
             || true,
             |_, _, _| after_save_called = true,

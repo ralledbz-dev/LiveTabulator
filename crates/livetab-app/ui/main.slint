@@ -70,6 +70,7 @@ export component MainWindow inherits Window {
 
     in-out property <string> status_text: "Bereit · lokale Verarbeitung";
     in-out property <string> audio_status_text: "Keine Audioquelle ausgewählt.";
+    in-out property <string> audio_metrics_text: "Keine gemessenen Capture-Frames.";
     in-out property <float> audio_progress: 0.0;
     in-out property <bool> audio_progress_visible: false;
     in-out property <string> audio_progress_text: "";
@@ -77,6 +78,8 @@ export component MainWindow inherits Window {
     in-out property <[string]> audio_device_names: [];
     in-out property <string> worker_status_text: "Analyse-Worker bereit";
     in-out property <string> current_chord_text: "—";
+    in-out property <string> live_pitch_text: "Noch kein sicherer Live-Pitch.";
+    in-out property <string> note_timeline_text: "Noch keine Live-NoteEvents.";
     in-out property <string> chord_correction_text: "";
     in-out property <string> current_key_text: "Tonart offen";
     in-out property <string> bpm_text: "— BPM";
@@ -103,6 +106,7 @@ export component MainWindow inherits Window {
     in-out property <string> prompt_text: "Erkläre kurz die aktuelle Akkordfolge.";
     in-out property <string> assistant_output_text: "Lokale Musiktheorie-Erklärungen erscheinen hier.";
     in-out property <string> playback_position_text: "00:00.0 / 00:00.0";
+    in-out property <string> seek_seconds_text: "0.0";
     in-out property <string> lyrics_edit_text: "";
     in-out property <int> lyrics_line_index: 0;
     in-out property <float> correction_time_seconds: 0;
@@ -192,6 +196,10 @@ export component MainWindow inherits Window {
     // Eingaben: Keine.
     // Ausgabe: Kein Rückgabewert; delegiert den Stopp an den Playback-Service.
     callback stop_playback_requested();
+    // Zweck: Springt Scheduler und nativen Sampleplayer gemeinsam zu einer Songsekunde.
+    // Eingaben: `seconds` – Textwert, den Rust endlich, nichtnegativ und im Songbereich prüft.
+    // Ausgabe: Kein Rückgabewert; Status und aktive Timelineereignisse werden aktualisiert.
+    callback seek_playback_requested(string);
     // Zweck: Ändert die Loop-Wiederholung des aktuellen Playback-Bereichs.
     // Eingaben: `enabled` – neuer Loopzustand.
     // Ausgabe: Kein Rückgabewert; der Controller validiert den Bereich.
@@ -224,6 +232,14 @@ export component MainWindow inherits Window {
     // Eingaben: `time_seconds` – Startzeit; `chord_name` – gewünschte Akkordbezeichnung.
     // Ausgabe: Kein Rückgabewert; der Controller validiert die Korrektur und aktualisiert Timeline/Projekt.
     callback correct_chord_requested(float, string);
+    // Zweck: Macht die letzte manuelle Projektkorrektur rückgängig.
+    // Eingaben: Keine; der Rust-Controller hält einen begrenzten Projektsnapshot-Verlauf.
+    // Ausgabe: Kein Rückgabewert; die Projektion und Wiedergabe werden nach Wiederherstellung aktualisiert.
+    callback undo_edit_requested();
+    // Zweck: Stellt die zuletzt rückgängig gemachte Projektkorrektur wieder her.
+    // Eingaben: Keine; der Rust-Controller validiert den Redo-Snapshot.
+    // Ausgabe: Kein Rückgabewert; die Projektion und Wiedergabe werden nach Wiederherstellung aktualisiert.
+    callback redo_edit_requested();
     // Zweck: Verschiebt den ersten Beat des analysierten Beatgrids auf den eingegebenen Audiooffset.
     // Eingaben: `offset_seconds` – endliche, nichtnegative Position in Sekunden.
     // Ausgabe: Kein Rückgabewert; der Controller validiert und veröffentlicht das neue Beatgrid.
@@ -290,6 +306,20 @@ export component MainWindow inherits Window {
                     // Zweck: Öffnet über den existierenden Rust-Callback eine Audiodatei.
                     // Eingaben: Nutzerklick; Ausgabe: Callback-Anforderung an den Controller.
                     clicked => { root.select_audio_requested(); }
+                }
+                Button {
+                    text: "Undo"; enabled: !root.busy;
+                    // Zweck: Macht die letzte explizite Projektkorrektur rückgängig.
+                    // Eingaben: Mausklick.
+                    // Ausgabe: Kein Rückgabewert; die Rust-Controllerhistorie wird aktualisiert.
+                    clicked => { root.undo_edit_requested(); }
+                }
+                Button {
+                    text: "Redo"; enabled: !root.busy;
+                    // Zweck: Stellt die zuletzt rückgängig gemachte Projektkorrektur wieder her.
+                    // Eingaben: Mausklick.
+                    // Ausgabe: Kein Rückgabewert; die Rust-Controllerhistorie wird aktualisiert.
+                    clicked => { root.redo_edit_requested(); }
                 }
                 Button {
                     text: root.live_running ? "Live stoppen" : "Live starten";
@@ -392,6 +422,8 @@ export component MainWindow inherits Window {
                         padding: 13px; spacing: 7px;
                         Text { text: "AUDIO INPUT"; color: #35d9ed; font-size: 11px; font-weight: 700; }
                         Text { text: root.audio_status_text; color: #d3e6f2; font-size: 10px; wrap: word-wrap; }
+                        Text { text: root.live_pitch_text; color: #bba1ff; font-size: 9px; wrap: word-wrap; }
+                        Text { text: root.audio_metrics_text; color: #88d9ee; font-size: 8px; wrap: word-wrap; }
                         HorizontalLayout {
                             spacing: 6px;
                             ComboBox {
@@ -509,6 +541,8 @@ export component MainWindow inherits Window {
                         Text { text: "ANALYSE & MODELLE"; color: #35d9ed; font-size: 11px; font-weight: 700; }
                         Text { text: root.worker_status_text; color: #b5f36b; font-size: 10px; wrap: word-wrap; }
                         Text { text: root.model_status_text; color: #d3e6f2; font-size: 10px; wrap: word-wrap; }
+                        Text { text: "KANONISCHE NOTEN"; color: #76d6ea; font-size: 8px; font-weight: 700; }
+                        Text { text: root.note_timeline_text; color: #d0dce9; font-size: 9px; font-family: "Consolas"; wrap: word-wrap; vertical-stretch: 1; }
                         Button {
                             text: root.scanning ? "Modelle werden geprüft …" : "Modellwurzeln scannen";
                             enabled: !root.scanning && !root.busy;
@@ -862,6 +896,15 @@ export component MainWindow inherits Window {
                     }
                     Rectangle { horizontal-stretch: 1; background: transparent; }
                     Text { text: root.playback_position_text; color: #e5f3ff; font-size: 11px; font-family: "Consolas"; }
+                    Text { text: "Seek s"; color: #91a4ba; font-size: 8px; vertical-alignment: center; }
+                    LineEdit { text <=> root.seek_seconds_text; width: 54px; horizontal-stretch: 0; enabled: !root.busy; }
+                    Button {
+                        text: "Go"; width: 40px; horizontal-stretch: 0; enabled: !root.busy;
+                        // Zweck: Setzt den Playbackcursor auf die angegebene Sekunde.
+                        // Eingaben: Mausklick; Sekundenwert steht in `seek_seconds_text`.
+                        // Ausgabe: Kein Rückgabewert; Validierung und Seek erfolgen im Rust-Controller.
+                        clicked => { root.seek_playback_requested(root.seek_seconds_text); }
+                    }
                     Text { text: "·"; color: #555a70; font-size: 14px; }
                     Text { text: root.beatgrid_text; color: #8faabd; font-size: 9px; wrap: word-wrap; }
                 }

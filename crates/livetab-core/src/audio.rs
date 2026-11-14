@@ -260,6 +260,226 @@ impl AudioRingBuffer {
     }
 }
 
+/// Gelesener, kanalgetrennter Block mit der absoluten Frameposition der Quelle.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InterleavedAudioBlock {
+    /// Absolute erste Eingabeframeposition; Sprünge zeigen verworfene Captureframes.
+    pub first_frame_index: u64,
+    /// Originalkanäle in interleaved Reihenfolge.
+    pub samples: Vec<f32>,
+    /// Kanalzahl des ursprünglichen Captureformats.
+    pub channels: u16,
+}
+
+impl InterleavedAudioBlock {
+    /// Zweck: Liefert die Zahl vollständiger interleaved Audioframes.
+    /// Eingaben: `self` – gelesener Block mit unveränderter Kanalzahl.
+    /// Ausgabe: Vollständige Zeitframes, nicht die Zahl einzelner Kanal-Samples.
+    pub fn frame_count(&self) -> usize {
+        self.samples.len() / usize::from(self.channels)
+    }
+}
+
+/// Vorallokierter SPSC-Ringpuffer für Originalkanäle und echte Capture-Framepositionen.
+#[derive(Debug)]
+pub struct InterleavedAudioRingBuffer {
+    sample_slots: Arc<[AtomicU32]>,
+    frame_indices: Arc<[AtomicU64]>,
+    channels: u16,
+    capacity_frames: usize,
+    write_sample_index: AtomicU64,
+    read_sample_index: AtomicU64,
+    next_input_frame: AtomicU64,
+    dropped_frames: AtomicU64,
+}
+
+impl InterleavedAudioRingBuffer {
+    /// Zweck: Reserviert einen festen Interleaved-SPSC-Puffer vor dem Start des Audiostreams.
+    /// Eingaben: Positive Framekapazität und eins bis acht Quellkanäle; Kapazität bleibt auf zehn Sekunden bei 192 kHz begrenzt.
+    /// Ausgabe: Leerer, vorallokierter Puffer oder ein Fehler bei ungültiger Größe/Allokation.
+    pub fn new(capacity_frames: usize, channels: u16) -> Result<Self, AudioError> {
+        const MAX_CAPACITY_FRAMES: usize = 1_920_000;
+        if capacity_frames == 0 || capacity_frames > MAX_CAPACITY_FRAMES || !(1..=8).contains(&channels) {
+            return Err(AudioError::InvalidFormat(
+                "Capturepuffer benötigt 1 bis 1.920.000 Frames und 1 bis 8 Kanäle.".into(),
+            ));
+        }
+        let capacity_samples = capacity_frames
+            .checked_mul(usize::from(channels))
+            .ok_or_else(|| AudioError::InvalidFormat("Capturepuffergröße läuft über.".into()))?;
+        let mut sample_slots = Vec::new();
+        sample_slots
+            .try_reserve_exact(capacity_samples)
+            .map_err(|error| AudioError::InvalidFormat(format!("Capturepuffer kann nicht reserviert werden: {error}")))?;
+        sample_slots.resize_with(capacity_samples, || AtomicU32::new(0));
+        let mut frame_indices = Vec::new();
+        frame_indices
+            .try_reserve_exact(capacity_frames)
+            .map_err(|error| AudioError::InvalidFormat(format!("Capture-Zeitstempel können nicht reserviert werden: {error}")))?;
+        frame_indices.resize_with(capacity_frames, || AtomicU64::new(0));
+        Ok(Self {
+            sample_slots: Arc::from(sample_slots.into_boxed_slice()),
+            frame_indices: Arc::from(frame_indices.into_boxed_slice()),
+            channels,
+            capacity_frames,
+            write_sample_index: AtomicU64::new(0),
+            read_sample_index: AtomicU64::new(0),
+            next_input_frame: AtomicU64::new(0),
+            dropped_frames: AtomicU64::new(0),
+        })
+    }
+
+    /// Zweck: Transportiert interleaved Float32-Samples ohne Heapallokation oder blockierenden Kanal.
+    /// Eingaben: `samples` – vollständige Quellframes; Werte außerhalb -1 bis 1 werden begrenzt.
+    /// Ausgabe: Zahl übernommener Frames; bei vollem Ring wird das ganze Paket gezählt und verworfen.
+    pub fn push_f32_interleaved(&self, samples: &[f32]) -> Result<usize, AudioError> {
+        self.push_values(samples.len(), |index| samples[index])
+    }
+
+    /// Zweck: Transportiert interleaved signed-16-PCM direkt in den vorallokierten Float-Ring.
+    /// Eingaben: `samples` – vollständige Quellframes im signed-16-Format.
+    /// Ausgabe: Zahl übernommener Frames oder Formatfehler; ein voller Ring verwirft das Paket.
+    pub fn push_i16_interleaved(&self, samples: &[i16]) -> Result<usize, AudioError> {
+        self.push_values(samples.len(), |index| f32::from(samples[index]) / 32768.0)
+    }
+
+    /// Zweck: Transportiert interleaved unsigned-16-PCM mit korrekter Nullpunktverschiebung.
+    /// Eingaben: `samples` – vollständige Quellframes im unsigned-16-Format.
+    /// Ausgabe: Zahl übernommener Frames oder Formatfehler; ein voller Ring verwirft das Paket.
+    pub fn push_u16_interleaved(&self, samples: &[u16]) -> Result<usize, AudioError> {
+        self.push_values(samples.len(), |index| {
+            (f32::from(samples[index]) - 32768.0) / 32768.0
+        })
+    }
+
+    /// Zweck: Überführt WASAPI-Float32-Bytes ohne Zwischen-`Vec` in den interleaved Ring.
+    /// Eingaben: Little-Endian-Floatbytes mit vollständigen Frames der konfigurierten Kanalzahl.
+    /// Ausgabe: Zahl übernommener Frames oder Fehler bei unvollständigem Sample-/Frameformat.
+    pub fn push_f32_le_bytes(&self, bytes: &[u8]) -> Result<usize, AudioError> {
+        if bytes.len() % 4 != 0 {
+            return Err(AudioError::InvalidFormat(
+                "Float32-Capturepaket enthält unvollständige Samples.".into(),
+            ));
+        }
+        let sample_count = bytes.len() / 4;
+        self.push_values(sample_count, |index| {
+            let offset = index * 4;
+            f32::from_le_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ])
+        })
+    }
+
+    /// Zweck: Liest einen begrenzten Block und überspringt dabei keine Kanalgrenzen.
+    /// Eingaben: `maximum_frames` – maximale Zahl vollständiger Frames für den Analyseworker.
+    /// Ausgabe: Interleaved Block mit Quellposition; außerhalb des Capturecallbacks darf ein Samplepuffer allokiert werden.
+    pub fn read_available(&self, maximum_frames: usize) -> InterleavedAudioBlock {
+        let channels = usize::from(self.channels);
+        let read = self.read_sample_index.load(Ordering::Relaxed);
+        let published = self.write_sample_index.load(Ordering::Acquire);
+        let available_frames = (published.saturating_sub(read) as usize) / channels;
+        let frame_count = available_frames.min(maximum_frames);
+        let sample_count = frame_count * channels;
+        let first_frame_index = if frame_count == 0 {
+            self.next_input_frame.load(Ordering::Acquire)
+        } else {
+            self.frame_indices[(read as usize / channels) % self.capacity_frames]
+                .load(Ordering::Acquire)
+        };
+        let mut samples = Vec::with_capacity(sample_count);
+        for offset in 0..sample_count {
+            let slot = ((read as usize) + offset) % self.sample_slots.len();
+            samples.push(f32::from_bits(self.sample_slots[slot].load(Ordering::Acquire)));
+        }
+        self.read_sample_index
+            .store(read + sample_count as u64, Ordering::Release);
+        InterleavedAudioBlock {
+            first_frame_index,
+            samples,
+            channels: self.channels,
+        }
+    }
+
+    /// Zweck: Liefert die aktuelle Füllmenge in vollständigen Captureframes.
+    /// Eingaben: `self` – Ringbuffer.
+    /// Ausgabe: Anzahl gelesener, aber noch nicht vom Analyseworker übernommener Frames.
+    pub fn queued_frames(&self) -> usize {
+        let queued = self
+            .write_sample_index
+            .load(Ordering::Acquire)
+            .saturating_sub(self.read_sample_index.load(Ordering::Acquire)) as usize;
+        queued / usize::from(self.channels)
+    }
+
+    /// Zweck: Liefert die seit dem Start verworfenen vollständigen Captureframes.
+    /// Eingaben: `self` – Ringbuffer.
+    /// Ausgabe: Monoton steigender Paketverlustzähler.
+    pub fn dropped_frames(&self) -> u64 {
+        self.dropped_frames.load(Ordering::Acquire)
+    }
+
+    /// Zweck: Liefert die Gesamtzahl empfangener Quellframes einschließlich verworfener Pakete.
+    /// Eingaben: `self` – Ringbuffer.
+    /// Ausgabe: Monotone absolute Frameposition der Capturequelle.
+    pub fn input_frames_seen(&self) -> u64 {
+        self.next_input_frame.load(Ordering::Acquire)
+    }
+
+    /// Zweck: Validiert Paketgrenzen, verwirft bei Überlast ganze Pakete und kopiert finite Werte atomar.
+    /// Eingaben: Sampleanzahl und formatbezogene Zugriffsfunktion; Aufrufer liefert nur vollständige Frames.
+    /// Ausgabe: Übernommene Framezahl oder `AudioError`, ohne Dateien, Locks oder UI-Aufrufe.
+    fn push_values<F>(&self, sample_count: usize, sample_at: F) -> Result<usize, AudioError>
+    where
+        F: Fn(usize) -> f32,
+    {
+        let channels = usize::from(self.channels);
+        if sample_count % channels != 0 {
+            return Err(AudioError::InvalidFormat(
+                "Capturepaket endet nicht an einer vollständigen Kanalframegrenze.".into(),
+            ));
+        }
+        let frame_count = sample_count / channels;
+        if frame_count == 0 {
+            return Ok(0);
+        }
+        let first_input_frame = self
+            .next_input_frame
+            .fetch_add(frame_count as u64, Ordering::AcqRel);
+        let write = self.write_sample_index.load(Ordering::Relaxed);
+        let read = self.read_sample_index.load(Ordering::Acquire);
+        let queued_samples = write.saturating_sub(read);
+        let capacity_samples = self.sample_slots.len() as u64;
+        if sample_count > self.sample_slots.len()
+            || queued_samples.saturating_add(sample_count as u64) > capacity_samples
+        {
+            self.dropped_frames
+                .fetch_add(frame_count as u64, Ordering::AcqRel);
+            return Ok(0);
+        }
+        for index in 0..sample_count {
+            let value = sample_at(index);
+            let clean = if value.is_finite() {
+                value.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            let slot = ((write as usize) + index) % self.sample_slots.len();
+            self.sample_slots[slot].store(clean.to_bits(), Ordering::Relaxed);
+        }
+        let first_frame_slot = (write as usize / channels) % self.capacity_frames;
+        for frame_offset in 0..frame_count {
+            let slot = (first_frame_slot + frame_offset) % self.capacity_frames;
+            self.frame_indices[slot].store(first_input_frame + frame_offset as u64, Ordering::Relaxed);
+        }
+        self.write_sample_index
+            .store(write + sample_count as u64, Ordering::Release);
+        Ok(frame_count)
+    }
+}
+
 /// Zweck: Dekodiert eine RIFF/WAVE-Datei mit PCM 8/16/24/32 Bit oder IEEE-float32.
 /// Eingaben: `path` – lokaler Dateipfad; Dateigröße wird vor dem Laden begrenzt.
 /// Ausgabe: Dekodierte interleaved Samples und Audioformat oder ein lesbarer WAV-/I/O-Fehler.

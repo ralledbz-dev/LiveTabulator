@@ -460,6 +460,13 @@ fn sha256_file(path: &Path) -> Result<String, ProjectError> {
     Ok(hex_lower(&hasher.finalize()))
 }
 
+/// Zweck: Berechnet den SHA-256-Hash einer lokalen Datei mit fest begrenztem Arbeitsspeicher.
+/// Eingaben: Lesbarer lokaler Dateipfad, beispielsweise ein GGUF-Modell.
+/// Ausgabe: 64-stellige kleingeschriebene Hex-Prüfsumme oder ein dateibezogener `ProjectError`.
+pub fn sha256_local_file(path: impl AsRef<Path>) -> Result<String, ProjectError> {
+    sha256_file(path.as_ref())
+}
+
 /// Zweck: Formatiert Bytes als kleingeschriebene Hexadezimalzeichenfolge.
 /// Eingaben: `bytes` – beliebige Bytefolge, typischerweise das SHA-256-Ergebnis.
 /// Ausgabe: Zwei ASCII-Hexziffern je Eingabebyte.

@@ -11,6 +11,7 @@ Hinweise:
 ===============================================================================
 */
 use crate::domain::{MusicalPosition, TimeSignature};
+use crate::timeline::TimelineMap;
 use crate::song::{LyricsWord, NoteEvent};
 use std::collections::BTreeMap;
 
@@ -31,6 +32,7 @@ pub struct PlaybackScheduler {
     duration_seconds: f64,
     bpm: f64,
     time_signature: TimeSignature,
+    timeline: TimelineMap,
     notes: Vec<NoteEvent>,
     lyrics: Vec<LyricsWord>,
     position_seconds: f64,
@@ -50,6 +52,27 @@ impl PlaybackScheduler {
         notes: Vec<NoteEvent>,
         lyrics: Vec<LyricsWord>,
     ) -> Result<Self, String> {
+        Self::new_with_timeline(
+            duration_seconds,
+            bpm,
+            time_signature,
+            notes,
+            lyrics,
+            TimelineMap::new(Vec::new(), Vec::new())?,
+        )
+    }
+
+    /// Zweck: Erstellt einen Scheduler mit der gemeinsamen Tempo-/Taktwechselkarte des Projekts.
+    /// Eingaben: Songdauer, Basis-BPM, Grundtakt, Note-/Lyrics-Events und validierte `TimelineMap`.
+    /// Ausgabe: Gestoppter Scheduler oder Validierungsfehler; Events bleiben in absoluten Audiosekunden.
+    pub fn new_with_timeline(
+        duration_seconds: f64,
+        bpm: f64,
+        time_signature: TimeSignature,
+        notes: Vec<NoteEvent>,
+        lyrics: Vec<LyricsWord>,
+        timeline: TimelineMap,
+    ) -> Result<Self, String> {
         if !duration_seconds.is_finite()
             || duration_seconds <= 0.0
             || !bpm.is_finite()
@@ -61,6 +84,7 @@ impl PlaybackScheduler {
             duration_seconds,
             bpm,
             time_signature,
+            timeline,
             notes,
             lyrics,
             position_seconds: 0.0,
@@ -169,8 +193,11 @@ impl PlaybackScheduler {
                     && self.position_seconds < word.end_seconds()
             })
             .map(|word| word.text().to_string());
-        let position = MusicalPosition::at(self.position_seconds, self.bpm, self.time_signature)
-            .map_err(|error| error.to_string())?;
+        let position = self.timeline.musical_position_at(
+            self.position_seconds,
+            self.bpm,
+            self.time_signature,
+        )?;
         Ok(PlaybackTick {
             position_seconds: self.position_seconds,
             position,
@@ -179,6 +206,20 @@ impl PlaybackScheduler {
             wrapped_loop: wrapped,
             ended,
         })
+    }
+
+    /// Zweck: Setzt den Wiedergabecursor und rekonstruiert aktive Noten/Lyrics ohne Zeitschritt.
+    /// Eingaben: Endliche Zielsekunden innerhalb der Songdauer und gegebenenfalls des Loopbereichs.
+    /// Ausgabe: `PlaybackTick` mit sofort aktualisierter Taktposition und aktiven Ereignissen.
+    pub fn seek(&mut self, seconds: f64) -> Result<PlaybackTick, String> {
+        if !seconds.is_finite() || !(0.0..=self.duration_seconds).contains(&seconds) {
+            return Err("Seekposition muss endlich und innerhalb der Songdauer liegen.".into());
+        }
+        if self.loop_region.is_some_and(|(start, end)| seconds < start || seconds >= end) {
+            return Err("Seekposition liegt außerhalb des aktiven Loopbereichs.".into());
+        }
+        self.position_seconds = seconds;
+        self.advance(0.0)
     }
 
     /// Zweck: Liefert den aktuellen Wiedergabecursor in Sekunden.
@@ -300,6 +341,30 @@ mod tests {
         assert_eq!(player.advance(1.0).unwrap().position_seconds, 0.5);
         player.stop();
         assert_eq!(player.position_seconds(), 0.0);
+    }
+
+    /// Zweck: Prüft Seek mit sofortiger Noten-/Lyrics-Rekonstruktion und Tempo-Map-Position.
+    /// Eingaben: Ein Note-/Lyricsfenster und ein Tempoabschnitt ab einer Sekunde.
+    /// Ausgabe: Keine Rückgabe; Assertions sichern Ereigniszustand und Loop-/Bereichsfehler.
+    #[test]
+    fn seek_reconstructs_events_on_the_shared_timeline() {
+        let note = NoteEvent::new(60, 0.5, 1.0).unwrap();
+        let lyric = LyricsWord::new("fire", 0.5, 1.2).unwrap();
+        let timeline = TimelineMap::new(
+            vec![crate::timeline::TempoChange { time_seconds: 1.0, bpm: 60.0 }],
+            vec![],
+        ).unwrap();
+        let mut player = PlaybackScheduler::new_with_timeline(
+            3.0, 120.0, TimeSignature::default(), vec![note], vec![lyric], timeline,
+        ).unwrap();
+        player.set_loop(Some((0.25, 2.0))).unwrap();
+        let tick = player.seek(1.0).unwrap();
+        assert_eq!(tick.active_midi_notes, vec![60]);
+        assert_eq!(tick.highlighted_lyric.as_deref(), Some("fire"));
+        assert_eq!(tick.position.bar, 1);
+        assert!((tick.position.beat - 3.0).abs() < 1e-9);
+        assert!(player.seek(2.5).is_err());
+        assert!(player.seek(f64::NAN).is_err());
     }
 
     /// Zweck: Prüft Loop-Wiederholung, ungültige Loopgrenzen, Mixer-Gain und Metronombegrenzung.

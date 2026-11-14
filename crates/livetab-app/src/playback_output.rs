@@ -144,6 +144,24 @@ impl PlaybackOutputSession {
             .store(0.0f64.to_bits(), Ordering::Release);
     }
 
+    /// Zweck: Setzt die atomare Quellposition des nativen Sampleplayers ohne Callback-Sperre.
+    /// Eingaben: Endliche Zielsekunden innerhalb der Audiodauer und des optionalen Loopbereichs.
+    /// Ausgabe: `Ok(())` oder Validierungsfehler; laufende Ausgabe setzt am nächsten Frame dort fort.
+    pub fn seek(&self, seconds: f64) -> Result<(), String> {
+        if !seconds.is_finite() || seconds < 0.0 || seconds > self.state.duration_seconds() {
+            return Err("Playback-Seek muss innerhalb der Audiodauer liegen.".into());
+        }
+        let loop_end = f64::from_bits(self.state.loop_end_bits.load(Ordering::Acquire));
+        if loop_end > 0.0 {
+            let loop_start = f64::from_bits(self.state.loop_start_bits.load(Ordering::Acquire));
+            if seconds < loop_start || seconds >= loop_end {
+                return Err("Playback-Seek liegt außerhalb des aktiven Loopbereichs.".into());
+            }
+        }
+        self.state.position_bits.store(seconds.to_bits(), Ordering::Release);
+        Ok(())
+    }
+
     /// Zweck: Setzt das relative Wiedergabetempo des Sampleplayers.
     /// Eingaben: Prozentwert 50 bis 150 gegenüber der Quellgeschwindigkeit.
     /// Ausgabe: `Ok(())` oder eine verständliche Bereichsmeldung.
