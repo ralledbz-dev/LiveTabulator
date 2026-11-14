@@ -2,7 +2,7 @@
 ===============================================================================
 Division By Zeros (DBZS) - Native Playback-Ausgabe
 Modul: playback_output
-Zweck: Gibt eine lokal dekodierte WAV-Datei plus Metronom über den nativen
+Zweck: Gibt eine lokal dekodierte WAV- oder MP3-Datei plus Metronom über den nativen
        Standard-Audioausgang aus, unabhängig vom Slint- und Analyse-Thread.
 Sprache: Rust
 Hinweise:
@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::thread;
 use std::time::Duration;
 
-/// Höchstbudget für f32-Samples aller parallel verfügbaren synchronen WAV-Quellen.
+/// Höchstbudget für f32-Samples aller parallel verfügbaren synchronen WAV-/MP3-Quellen.
 const MAX_SYNCHRONIZED_DECODED_BYTES: usize = 768 * 1024 * 1024;
 
 /// Laufende native Wiedergabe, steuerbar ohne Zugriff auf den plattformspezifischen Stream.
@@ -27,7 +27,7 @@ pub struct PlaybackOutputSession {
 }
 
 impl PlaybackOutputSession {
-    /// Zweck: Öffnet den Standardausgang für eine einzelne lokale WAV-Quelle.
+    /// Zweck: Öffnet den Standardausgang für eine einzelne lokale WAV-/MP3-Quelle.
     /// Eingaben: Dekodierte lokale WAV-Datei; Ausgabegerät/-format stammen vom Audiohost.
     /// Ausgabe: Kontrollhandle oder ein klarer Geräte-/Format-/Streamfehler.
     pub fn start(wave: WaveFile) -> Result<Self, String> {
@@ -35,14 +35,14 @@ impl PlaybackOutputSession {
     }
 
     /// Zweck: Startet einen nativen Stream mit umschaltbaren, zeitlich ausgerichteten WAV-Quellen.
-    /// Eingaben: `(id, WAV)`-Quellen und die anfänglich aktive ID; maximal sechs Quellen.
+    /// Eingaben: `(id, WAV-/MP3-)`-Quellen und die anfänglich aktive ID; maximal sechs Quellen.
     /// Ausgabe: Kontrollhandle oder ein Validierungs-/Geräte-/Streamfehler.
     pub fn start_sources(
         sources: Vec<(String, WaveFile)>,
         initial_source_id: &str,
     ) -> Result<Self, String> {
         if sources.is_empty() || sources.len() > 6 {
-            return Err("Playback benötigt eine bis sechs WAV-Quellen.".into());
+            return Err("Playback benötigt eine bis sechs Audioquellen.".into());
         }
         let decoded_bytes = sources.iter().fold(0usize, |total, (_, wave)| {
             total.saturating_add(
@@ -61,7 +61,9 @@ impl PlaybackOutputSession {
             }
             if wave.format.sample_rate == 0 || wave.format.channels == 0 || wave.frame_count() == 0
             {
-                return Err(format!("Playback-WAV `{id}` ist leer oder ungültig."));
+                return Err(format!(
+                    "Playback-Audioquelle `{id}` ist leer oder ungültig."
+                ));
             }
             durations.push(wave.duration_seconds());
             if id == initial_source_id {
@@ -243,14 +245,14 @@ struct PlaybackSource {
 
 impl PlaybackState {
     /// Zweck: Erstellt den atomaren Audiozustand mit pausierter Ausgabe und deaktiviertem Metronom.
-    /// Eingaben: Validierte WAV-Quelle.
+    /// Eingaben: Validierte WAV-/MP3-Quelle.
     /// Ausgabe: Thread-sicherer Zustand für das native Audiogerät.
     fn new(wave: WaveFile) -> Self {
         Self::new_sources(vec![("source".into(), wave)], 0)
     }
 
     /// Zweck: Erstellt den atomaren Zustand aus einer Quellenliste und einem gültigen Index.
-    /// Eingaben: `(id, WAV)`-Quellen sowie Index der anfänglich aktiven WAV.
+    /// Eingaben: `(id, WAV-/MP3-)`-Quellen sowie Index der anfänglich aktiven WAV-/MP3-Quelle.
     /// Ausgabe: Pausierter Playbackzustand mit gemeinsamem Zeit-/Loop-/Tempo-Cursor.
     fn new_sources(sources: Vec<(String, WaveFile)>, active_source_index: usize) -> Self {
         Self {

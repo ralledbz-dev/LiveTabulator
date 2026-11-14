@@ -25,6 +25,7 @@ pub enum JobKind {
     TabGeneration,
     Export,
     Recording,
+    AudioImport,
     ModelLoad,
     ProjectImport,
 }

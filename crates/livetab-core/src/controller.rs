@@ -11,7 +11,7 @@ Hinweise:
 ===============================================================================
 */
 use crate::analysis::{AnalysisConfig, AnalysisResult, analyze_wave_with_cancel};
-use crate::audio::{AudioFrame, WaveFile, read_wav};
+use crate::audio::{AudioFrame, WaveFile, read_audio_with_progress};
 use crate::domain::{Chord, ChordQuality, KeyMode, KeySignature, NoteName};
 use crate::dsp::{extract_chroma, measure_level, waveform_bars};
 use crate::event_bus::{AppEvent, EventBus};
@@ -168,22 +168,37 @@ impl AppController {
         Ok(())
     }
 
-    /// Zweck: Öffnet und dekodiert eine lokale WAV-Datei ohne UI-Threadarbeit.
-    /// Eingaben: Lokaler WAV-Dateipfad.
-    /// Ausgabe: `WaveFile` mit dekodierten Samples oder WAV-/Dateizugriffsfehler.
+    /// Zweck: Öffnet und dekodiert eine lokale WAV- oder MP3-Datei ohne UI-Threadarbeit.
+    /// Eingaben: Lokaler Audiodateipfad mit unterstützter WAV-/MP3-Endung.
+    /// Ausgabe: `WaveFile` mit dekodierten Samples oder format-/dateibezogener Fehler.
     pub fn open_audio(&self, path: impl AsRef<Path>) -> Result<WaveFile, String> {
+        self.open_audio_with_progress(path, |_| {})
+    }
+
+    /// Zweck: Öffnet eine WAV-/MP3-Datei und meldet während des realen Dekodierens den gemessenen Fortschritt.
+    /// Eingaben: Lokaler WAV-/MP3-Pfad und Callback mit monotonem Anteil von null bis eins.
+    /// Ausgabe: Dekodierte `WaveFile` und aktualisiertes Projekt oder ein Datei-/Format-/Sperrfehler.
+    pub fn open_audio_with_progress<F>(
+        &self,
+        path: impl AsRef<Path>,
+        mut progress: F,
+    ) -> Result<WaveFile, String>
+    where
+        F: FnMut(f32),
+    {
         let path = path.as_ref();
-        let wave = read_wav(path).map_err(|error| error.to_string())?;
+        let wave =
+            read_audio_with_progress(path, &mut progress).map_err(|error| error.to_string())?;
         self.set_audio_source(path.to_path_buf(), &wave)?;
         self.observer.log(
             LogLevel::Info,
             LogCategory::Audio,
-            format!("WAV dekodiert: {} Frames", wave.frame_count()),
+            format!("Audio dekodiert: {} Frames", wave.frame_count()),
             format!(
                 "Audioquelle geöffnet: {}",
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .unwrap_or("WAV")
+                    .unwrap_or("Audiodatei")
             ),
             BTreeMap::new(),
             None,
@@ -192,14 +207,14 @@ impl AppController {
     }
 
     /// Zweck: Führt den vollständigen Rust-DSP-Offlinepass aus und übernimmt erkannte Ereignisse ins Projekt.
-    /// Eingaben: Lokaler WAV-Pfad und gültige Songtaktart; Datei wird einmal dekodiert.
+    /// Eingaben: Lokaler WAV-/MP3-Pfad und gültige Songtaktart; Datei wird einmal dekodiert.
     /// Ausgabe: Analyseergebnis mit Chords, Pitch, Key, Beatgrid, Warnungen und Dauer.
     pub fn analyze_audio_file(&self, path: impl AsRef<Path>) -> Result<AnalysisResult, String> {
         self.analyze_audio_file_with_cancel(path, || false)
     }
 
     /// Zweck: Führt den Offline-DSP-Pass auf einem Worker aus und prüft vor jedem Analyseframe den Abbruchstatus.
-    /// Eingaben: WAV-Pfad und kooperativer Abfragecallback, typischerweise aus einem `CancellationToken`.
+    /// Eingaben: WAV-/MP3-Pfad und kooperativer Abfragecallback, typischerweise aus einem `CancellationToken`.
     /// Ausgabe: Analyseergebnis oder expliziter Abbruch-/Dateifehler; ein abgebrochener Pass übernimmt keine Teilergebnisse.
     pub fn analyze_audio_file_with_cancel<F>(
         &self,

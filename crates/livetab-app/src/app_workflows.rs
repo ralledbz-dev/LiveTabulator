@@ -12,10 +12,11 @@ Hinweise:
 ===============================================================================
 */
 use crate::audio_capture::{self, CaptureSession};
+use crate::audio_encoding::{RecordingFormat, recording_format, write_recording_audio};
 use crate::playback_output::PlaybackOutputSession;
 use crate::stem_workflow::{self, StemRunContext};
 use crate::{MainWindow, ModelCatalog, application_data_directory};
-use livetab_core::audio::{read_wav, write_wav};
+use livetab_core::audio::read_audio;
 use livetab_core::event_bus::AppEvent;
 use livetab_core::export::load_dbztab;
 use livetab_core::jobs::{JobEvent, JobHandle, JobKind, JobState};
@@ -81,6 +82,7 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
     let deep_job: Arc<Mutex<Option<JobHandle>>> = Arc::new(Mutex::new(None));
     let stem_job: Arc<Mutex<Option<JobHandle>>> = Arc::new(Mutex::new(None));
     let pending_stem_download: Arc<Mutex<Option<StemRunContext>>> = Arc::new(Mutex::new(None));
+    let recording_wav_saved = Arc::new(AtomicBool::new(false));
     let active_audio_source_id = Arc::new(Mutex::new("source".to_string()));
     let playback_clock_started = Arc::new(AtomicBool::new(false));
     start_event_dispatcher(
@@ -257,8 +259,12 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
                     Ok(()) => {
                         handle.set_recording(true);
                         handle.set_audio_status_text(
-                            "WAV-Aufnahme läuft · maximal zehn Minuten".into(),
+                            "WAV/MP3-Aufnahme läuft · maximal zehn Minuten".into(),
                         );
+                        handle.set_audio_progress(0.0);
+                        handle.set_audio_progress_text("Aufnahme 00:00 / 10:00 · 0 Samples".into());
+                        handle.set_audio_progress_visible(true);
+                        start_recording_progress_monitor(weak.clone(), Arc::clone(&capture));
                     }
                     Err(error) => handle.set_status_text(error.into()),
                 }
@@ -266,7 +272,13 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
             }
             let Some(path) = choose_recording_save_path() else {
                 handle.set_audio_status_text(
-                    "WAV-Speichern abgebrochen; die Aufnahme läuft weiter.".into(),
+                    "WAV/MP3-Speichern abgebrochen; die Aufnahme läuft weiter.".into(),
+                );
+                return;
+            };
+            let Some(format) = recording_format(&path) else {
+                handle.set_audio_status_text(
+                    "Aufnahme bitte mit `.wav` oder `.mp3` speichern; sie läuft weiter.".into(),
                 );
                 return;
             };
@@ -289,6 +301,9 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
             handle.set_recording(false);
             handle.set_deep_running(true);
             handle.set_busy(true);
+            handle.set_audio_progress(0.0);
+            handle.set_audio_progress_text(format!("{} wird lokal gespeichert …", format.label()).into());
+            handle.set_audio_progress_visible(true);
             handle.set_worker_status_text(
                 "Liveaufnahme wird lokal gespeichert und anschließend vollständig analysiert …"
                     .into(),
@@ -298,23 +313,34 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
             let analysis_controller = controller.clone();
             let weak_after_save = weak.clone();
             let weak_after_analysis = weak.clone();
+            let weak_for_progress = weak.clone();
             let path_for_ui = path.clone();
             let recording_wav_saved = Arc::clone(&recording_wav_saved);
             let job = manager.start(JobKind::DeepAnalysis, move |reporter, cancellation| {
-                reporter.progress(0.05, "Live-Audio wird als lokale Mono-WAV gespeichert");
+                reporter.progress(
+                    0.05,
+                    format!("Live-Audio wird als lokale {} gespeichert", format.label()),
+                );
                 let saved_path_for_ui = path.clone();
                 let save_reporter = reporter.clone();
+                let progress_reporter = reporter.clone();
+                let progress_weak = weak_for_progress.clone();
+                let format_label_for_saved_status = format.label().to_string();
+                let mut last_reported = 0.0_f32;
                 let summary = save_and_analyze_recording(
                     &analysis_controller,
                     &path,
                     samples,
                     sample_rate,
+                    format,
                     || cancellation.is_cancelled(),
                     move |waveform, duration_seconds, rate| {
-                        recording_wav_saved.store(true, Ordering::Release);
+                        if format == RecordingFormat::Wav {
+                            recording_wav_saved.store(true, Ordering::Release);
+                        }
                         save_reporter.progress(
                             0.2,
-                            "WAV gesichert · vollständige lokale DSP-Analyse läuft",
+                            format!("{} gespeichert · vollständige lokale DSP-Analyse läuft", format.label()),
                         );
                         let _ = weak_after_save.upgrade_in_event_loop(move |handle| {
                             handle.set_audio_path_text(
@@ -322,12 +348,32 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
                             );
                             handle.set_audio_status_text(
                                 format!(
-                                    "Live-Audio-WAV gesichert · {:.2}s · {rate} Hz · Offline-Analyse läuft",
+                                    "Live-Audio-{} gespeichert · {:.2}s · {rate} Hz · Offline-Analyse läuft",
+                                    format_label_for_saved_status,
                                     duration_seconds
                                 )
                                 .into(),
                             );
                             handle.set_waveform_text(waveform.into());
+                        });
+                    },
+                    move |progress| {
+                        if progress < 1.0 && progress - last_reported < 0.005 {
+                            return;
+                        }
+                        last_reported = progress;
+                        let message = if progress >= 1.0 {
+                            format!("{}-Datei lokal gespeichert", format.label())
+                        } else {
+                            format!("{} wird kodiert/geschrieben · {:.0}%", format.label(), progress * 100.0)
+                        };
+                        progress_reporter.progress(0.05 + progress * 0.15, message.clone());
+                        let shown_progress = progress;
+                        let shown_text = message;
+                        let _ = progress_weak.clone().upgrade_in_event_loop(move |handle| {
+                            handle.set_audio_progress(shown_progress);
+                            handle.set_audio_progress_text(shown_text.into());
+                            handle.set_audio_progress_visible(shown_progress < 1.0);
                         });
                     },
                 )?;
@@ -341,13 +387,15 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
                     path.display()
                 );
                 let completed_path = path_for_ui.clone();
+                let format_label = format.label().to_string();
+                let format_label_for_status = format_label.clone();
                 let _ = weak_after_analysis.upgrade_in_event_loop(move |handle| {
                     handle.set_audio_path_text(
                         completed_path.to_string_lossy().into_owned().into(),
                     );
                     handle.set_audio_status_text(
                         format!(
-                            "Live-Audio analysiert · {:.2}s · {} Hz · {} Akkorde · {} Noten",
+                            "Live-Audio ({format_label_for_status}) analysiert · {:.2}s · {} Hz · {} Akkorde · {} Noten",
                             summary.duration_seconds,
                             summary.sample_rate,
                             summary.chord_count,
@@ -355,9 +403,19 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
                         )
                         .into(),
                     );
+                    handle.set_audio_progress_visible(false);
+                    if format_label == "MP3" && handle.get_auto_stem_after_recording_available() {
+                        handle.set_stem_status_text(
+                            "MP3 wurde lokal analysiert; die automatische Stem-Trennung benötigt eine WAV-Aufnahme."
+                                .into(),
+                        );
+                    }
                     update_project_view(&handle, &analysis_controller);
                 });
-                reporter.progress(1.0, "Live-Audio-WAV gespeichert und offline analysiert");
+                reporter.progress(
+                    1.0,
+                    format!("Live-Audio-{} gespeichert und offline analysiert", format.label()),
+                );
                 Ok(message)
             });
             if let Ok(mut active) = deep_job.lock() {
@@ -379,7 +437,8 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
                 }
             };
             let Some(path) = snapshot.audio_path.clone() else {
-                handle.set_status_text("Bitte zuerst eine lokale WAV-Datei öffnen.".into());
+                handle
+                    .set_status_text("Bitte zuerst eine lokale WAV- oder MP3-Datei öffnen.".into());
                 return;
             };
             handle.set_deep_running(true);
@@ -389,7 +448,7 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
             let manager = controller.job_manager();
             let job = manager.start(JobKind::DeepAnalysis, move |reporter, cancellation| {
                 cancellation.check()?;
-                reporter.progress(0.02, "WAV wird dekodiert");
+                reporter.progress(0.02, "Lokale WAV-/MP3-Datei wird dekodiert");
                 let result = controller
                     .analyze_audio_file_with_cancel(&path, || cancellation.is_cancelled())?;
                 cancellation.check()?;
@@ -515,12 +574,7 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
                             .into(),
                     );
                     handle.set_status_text(
-                        "Modell-Download abgelehnt; keine Änderungen vorgenommen.".into(),
-                        "Modell nicht heruntergeladen; WAV und DSP-Ergebnis bleiben erhalten, bisherige Stem-Spuren bleiben unverändert."
-                            .into(),
-                    );
-                    handle.set_status_text(
-                        "Modell-Download abgelehnt; Modellbestand und vorhandene Stem-Spuren wurden nicht geändert."
+                        "Modell-Download abgelehnt; keine Änderungen vorgenommen. WAV und DSP-Ergebnis bleiben erhalten, vorhandene Stem-Spuren und Modellbestand wurden nicht geändert."
                             .into(),
                     );
                 }
@@ -1002,55 +1056,69 @@ pub fn wire(ui: &MainWindow, controller: AppController, models: ModelCatalog) ->
     }
 }
 
-/// Zweck: Dekodiert eine WAV-Datei auf einem Worker und aktualisiert das Projekt-/Waveform-UI.
+/// Zweck: Dekodiert eine WAV- oder MP3-Datei auf einem Worker und aktualisiert Projekt-/Waveform-UI.
 /// Eingaben: Schwacher Fensterhandle, Controller und lokale Audiodatei.
-/// Ausgabe: Keine; Status, Dauer und Waveform erscheinen nach Abschluss im UI-Thread.
+/// Ausgabe: Keine; Dekodierfortschritt, Dauer und Waveform erscheinen über Job-/UI-Events.
 fn open_audio_async(weak: Weak<MainWindow>, controller: AppController, path: PathBuf) {
     if let Some(handle) = weak.upgrade() {
         if handle.get_busy() {
             return;
         }
         handle.set_busy(true);
-        handle.set_audio_status_text("WAV wird lokal dekodiert …".into());
+        handle.set_audio_status_text("Lokale Audioquelle wird dekodiert …".into());
+        handle.set_audio_progress(0.0);
+        handle.set_audio_progress_text("WAV/MP3 wird eingelesen und dekodiert …".into());
+        handle.set_audio_progress_visible(true);
     }
-    thread::spawn(move || {
-        let result = controller.open_audio(&path).map(|wave| {
-            (
-                wave.duration_seconds(),
-                wave.format.sample_rate,
-                wave.format.channels,
-                livetab_core::dsp::waveform_bars(&wave.samples, 72),
-            )
-        });
-        let _ = weak.upgrade_in_event_loop(move |handle| {
-            handle.set_busy(false);
-            match result {
-                Ok((duration, rate, channels, waveform)) => {
-                    handle.set_audio_status_text(
-                        format!(
-                            "{} · {:.2}s · {} Hz · {} Kanal/Kanäle",
-                            path.file_name()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or("Audio"),
-                            duration,
-                            rate,
-                            channels
-                        )
-                        .into(),
-                    );
-                    handle.set_waveform_text(waveform.into());
-                    handle.set_worker_status_text(
-                        "Audioquelle bereit · Deep-Analyse kann separat gestartet werden".into(),
-                    );
-                    handle.set_status_text("Lokale WAV-Datei geöffnet.".into());
-                    update_project_view(&handle, &controller);
-                }
-                Err(error) => {
-                    handle.set_audio_status_text(error.clone().into());
-                    handle.set_status_text(error.into());
-                }
+    let manager = controller.job_manager();
+    let worker_controller = controller.clone();
+    manager.start(JobKind::AudioImport, move |reporter, cancellation| {
+        cancellation.check()?;
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("Audio")
+            .to_ascii_uppercase();
+        let mut last_reported = 0.0_f32;
+        let wave = worker_controller.open_audio_with_progress(&path, |progress| {
+            if progress < 1.0 && progress - last_reported < 0.005 {
+                return;
             }
+            last_reported = progress;
+            reporter.progress(
+                progress,
+                format!("{extension} wird dekodiert · {:.0}%", progress * 100.0),
+            );
+        })?;
+        cancellation.check()?;
+        let duration = wave.duration_seconds();
+        let rate = wave.format.sample_rate;
+        let channels = wave.format.channels;
+        let waveform = livetab_core::dsp::waveform_bars(&wave.samples, 72);
+        let path_for_ui = path.clone();
+        let controller_for_ui = worker_controller.clone();
+        let _ = weak.upgrade_in_event_loop(move |handle| {
+            handle.set_audio_status_text(
+                format!(
+                    "{} · {:.2}s · {} Hz · {} Kanal/Kanäle",
+                    path_for_ui
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("Audio"),
+                    duration,
+                    rate,
+                    channels
+                )
+                .into(),
+            );
+            handle.set_waveform_text(waveform.into());
+            handle.set_worker_status_text(
+                "Audioquelle bereit · Deep-Analyse kann separat gestartet werden".into(),
+            );
+            handle.set_status_text("Lokale Audiodatei geöffnet.".into());
+            update_project_view(&handle, &controller_for_ui);
         });
+        Ok(format!("Lokale Audiodatei geöffnet: {}", path.display()))
     });
 }
 
@@ -1064,28 +1132,37 @@ struct RecordingAnalysisSummary {
     analyzed_frames: usize,
 }
 
-/// Zweck: Speichert erfasste Live-Audiosamples beliebiger lokaler Quellen als WAV und startet die vollständige Rust-DSP-Analyse.
-/// Eingaben: Controller, WAV-Ziel, besessene Mono-Samples, Sample-Rate, kooperative Abfrage und Callback nach erfolgreichem Schreiben.
-/// Ausgabe: Analysekennzahlen oder ein Schreib-, Kurzsignal-, Datei- oder Abbruchfehler; gespeicherte WAV bleibt bei Analysefehlern erhalten.
-fn save_and_analyze_recording<F, S>(
+/// Zweck: Speichert erfasste Live-Audiosamples als WAV oder MP3 und startet die vollständige Rust-DSP-Analyse.
+/// Eingaben: Controller, lokales WAV-/MP3-Ziel, Mono-Samples, Sample-Rate, Abfrage-/Fortschrittscallback und Callback nach dem Schreiben.
+/// Ausgabe: Analysekennzahlen oder ein Schreib-, Kurzsignal-, Datei- oder Abbruchfehler; gespeicherte Aufnahme bleibt bei Analysefehlern erhalten.
+fn save_and_analyze_recording<F, S, P>(
     controller: &AppController,
     path: &std::path::Path,
     samples: Vec<f32>,
     sample_rate: u32,
+    format: RecordingFormat,
     mut is_cancelled: F,
     after_save: S,
+    mut progress: P,
 ) -> Result<RecordingAnalysisSummary, String>
 where
     F: FnMut() -> bool,
     S: FnOnce(String, f64, u32),
+    P: FnMut(f32),
 {
     if sample_rate == 0 || samples.is_empty() {
         return Err("Die Liveaufnahme enthält keine gültigen Samples.".into());
     }
+    if recording_format(path) != Some(format) {
+        return Err(
+            "Aufnahmen können nur mit passender `.wav`- oder `.mp3`-Endung gespeichert werden."
+                .into(),
+        );
+    }
     if is_cancelled() {
         return Err("Aufnahme-Analyse wurde vor dem Speichern abgebrochen.".into());
     }
-    write_wav(path, &samples, sample_rate, 1).map_err(|error| error.to_string())?;
+    write_recording_audio(path, &samples, sample_rate, &mut progress)?;
     let duration_seconds = samples.len() as f64 / f64::from(sample_rate);
     let waveform = livetab_core::dsp::waveform_bars(&samples, 72);
     after_save(waveform, duration_seconds, sample_rate);
@@ -1100,7 +1177,49 @@ where
     })
 }
 
-/// Zweck: Öffnet eine lokale WAV-Quelle und startet die synchrone native Audio-/Schedulerwiedergabe.
+/// Zweck: Aktualisiert die Audiokarte ausschließlich mit Samples, die der Capture-DSP bereits gepuffert hat.
+/// Eingaben: Slint-Weak-Handle und geteilte aktive Capture-Session.
+/// Ausgabe: Keine; beendet sich nach Aufnahmeende oder sobald die UI nicht mehr erreichbar ist.
+fn start_recording_progress_monitor(
+    weak: Weak<MainWindow>,
+    capture: Arc<Mutex<Option<CaptureSession>>>,
+) {
+    thread::Builder::new()
+        .name("livetab-recording-progress".into())
+        .spawn(move || {
+            while weak.upgrade().is_some() {
+                thread::sleep(Duration::from_millis(200));
+                let snapshot = capture.lock().ok().and_then(|active| {
+                    active
+                        .as_ref()
+                        .and_then(CaptureSession::recording_progress_snapshot)
+                });
+                let Some((samples, maximum_samples, sample_rate)) = snapshot else {
+                    break;
+                };
+                let progress = (samples as f32 / maximum_samples.max(1) as f32).clamp(0.0, 1.0);
+                let captured_seconds = samples as u64 / u64::from(sample_rate);
+                let maximum_seconds = maximum_samples as u64 / u64::from(sample_rate);
+                let text = format!(
+                    "Aufnahme {:02}:{:02} / {:02}:{:02} · {samples} Samples",
+                    captured_seconds / 60,
+                    captured_seconds % 60,
+                    maximum_seconds / 60,
+                    maximum_seconds % 60
+                );
+                let _ = weak.clone().upgrade_in_event_loop(move |handle| {
+                    if handle.get_recording() {
+                        handle.set_audio_progress(progress);
+                        handle.set_audio_progress_text(text.into());
+                        handle.set_audio_progress_visible(true);
+                    }
+                });
+            }
+        })
+        .ok();
+}
+
+/// Zweck: Öffnet eine lokale WAV-/MP3-Quelle und startet die synchrone native Audio-/Schedulerwiedergabe.
 /// Eingaben: Fenster, Controller, geteiltes Ausgabehandle, Shutdown-/Clockflags, Tempo und Loopzustand.
 /// Ausgabe: Keine; Gerätefehler und Startstatus werden asynchron an die UI zurückgemeldet.
 fn start_playback_async(
@@ -1126,7 +1245,7 @@ fn start_playback_async(
     };
     let Some(path) = project.audio_path.clone() else {
         handle.set_status_text(
-            "Bitte zuerst eine lokale WAV-Datei öffnen; Playback benötigt eine Audioquelle.".into(),
+            "Bitte zuerst eine lokale WAV- oder MP3-Datei öffnen; Playback benötigt eine Audioquelle.".into(),
         );
         return;
     };
@@ -1150,7 +1269,9 @@ fn start_playback_async(
         handle.set_active_audio_source_label("Original".into());
     }
     handle.set_busy(true);
-    handle.set_worker_status_text("Original und synchronisierte Stem-WAVs werden geladen …".into());
+    handle.set_worker_status_text(
+        "Original (WAV/MP3) und synchronisierte Stem-WAVs werden geladen …".into(),
+    );
     let bpm = project.bpm;
     let meter_numerator = project.time_signature.numerator();
     let project_duration = project.duration_seconds;
@@ -1164,7 +1285,7 @@ fn start_playback_async(
                             .map_err(|error| format!("{}: {error}", path.display()))?
                             .len();
                         total.checked_add(file_bytes).ok_or_else(|| {
-                            "Gesamtgröße der Playback-WAVs ist nicht darstellbar.".into()
+                            "Gesamtgröße der Playback-Audiodateien ist nicht darstellbar.".into()
                         })
                     },
                 )?;
@@ -1177,7 +1298,7 @@ fn start_playback_async(
             let sources = source_paths
                 .into_iter()
                 .map(|(id, path)| {
-                    read_wav(&path)
+                    read_audio(&path)
                         .map(|wave| (id, wave))
                         .map_err(|error| format!("{}: {error}", path.display()))
                 })
@@ -1227,7 +1348,7 @@ fn start_playback_async(
                     }
                     handle.set_playback_running(true);
                     handle.set_playback_paused(false);
-                    handle.set_worker_status_text("Lokale WAV-Wiedergabe läuft".into());
+                    handle.set_worker_status_text("Lokale Audiowiedergabe läuft".into());
                     ensure_playback_clock(
                         controller.clone(),
                         handle.as_weak(),
@@ -1311,6 +1432,7 @@ fn start_event_dispatcher(
                             if !running {
                                 capture_requested.store(false, Ordering::Release);
                                 handle.set_recording(false);
+                                handle.set_audio_progress_visible(false);
                                 if let Ok(mut active) = capture.lock() {
                                     if let Some(session) = active.take() {
                                         thread::spawn(move || session.stop());
@@ -1483,6 +1605,9 @@ fn start_job_dispatcher(
                     if kind == JobKind::DeepAnalysis {
                         handle.set_deep_running(!terminal);
                         handle.set_busy(!terminal);
+                        if terminal {
+                            handle.set_audio_progress_visible(false);
+                        }
                     }
                     if kind == JobKind::StemSeparation {
                         handle.set_stem_running(!terminal);
@@ -1490,9 +1615,18 @@ fn start_job_dispatcher(
                     if kind == JobKind::StemSeparation {
                         handle.set_stem_running(!terminal);
                     }
-                    handle.set_worker_status_text(
-                        format!("{:?} · {:.0}% · {message}", status, progress * 100.0).into(),
-                    );
+                    if matches!(kind, JobKind::AudioImport | JobKind::Recording) {
+                        handle.set_audio_progress(progress);
+                        handle.set_audio_progress_text(message.clone().into());
+                        handle.set_audio_progress_visible(!terminal);
+                        if kind == JobKind::AudioImport {
+                            handle.set_busy(!terminal);
+                        }
+                        if terminal && status != JobState::Succeeded {
+                            handle.set_audio_status_text(message.clone().into());
+                        }
+                    }
+                    handle.set_worker_status_text(format!("{:?} · {message}", status).into());
                     if terminal {
                         if let Ok(mut active) = deep_job.lock() {
                             if kind == JobKind::DeepAnalysis {
@@ -1895,13 +2029,14 @@ fn start_project_save(weak: Weak<MainWindow>, controller: AppController, path: P
 
 /// Zweck: Öffnet einen nativen lokalen Audiodateidialog oder meldet die fehlende Plattformintegration.
 /// Eingaben: Keine.
-/// Ausgabe: Ausgewählte WAV-Datei oder `None` bei Abbruch/nicht unterstützter Plattform.
+/// Ausgabe: Ausgewählte WAV-/MP3-Datei oder `None` bei Abbruch/nicht unterstützter Plattform.
 fn choose_audio_path() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         return FileDialog::new()
-            .set_title("Lokale WAV-Datei auswählen")
+            .set_title("Lokale WAV- oder MP3-Datei auswählen")
             .add_filter("WAV-Audio", &["wav"])
+            .add_filter("MP3-Audio", &["mp3"])
             .pick_file();
     }
     #[cfg(not(windows))]
@@ -1910,16 +2045,17 @@ fn choose_audio_path() -> Option<PathBuf> {
     }
 }
 
-/// Zweck: Öffnet den Dialog zum Speichern einer lokalen Mono-PCM-WAV-Aufnahme.
+/// Zweck: Öffnet den Dialog zum Speichern einer lokalen Monoaufnahme als WAV oder MP3.
 /// Eingaben: Keine; der Nutzer wählt den endgültigen lokalen Dateipfad.
 /// Ausgabe: Zielpfad oder `None` bei Abbruch/nicht unterstützter Plattform.
 fn choose_recording_save_path() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         return FileDialog::new()
-            .set_title("Live-Aufnahme als WAV speichern")
-            .set_file_name("Live-Aufnahme.wav")
+            .set_title("Live-Aufnahme als WAV oder MP3 speichern")
+            .set_file_name("Live-Aufnahme")
             .add_filter("PCM-WAV", &["wav"])
+            .add_filter("MP3-Audio", &["mp3"])
             .save_file();
     }
     #[cfg(not(windows))]
@@ -2138,8 +2274,10 @@ mod recording_workflow_tests {
             &path,
             samples,
             sample_rate,
+            RecordingFormat::Wav,
             || false,
             |waveform, duration, rate| saved_info = Some((waveform, duration, rate)),
+            |_| {},
         )
         .unwrap();
 
@@ -2177,8 +2315,10 @@ mod recording_workflow_tests {
             &path,
             vec![0.0; 4096],
             48_000,
+            RecordingFormat::Wav,
             || true,
             |_, _, _| after_save_called = true,
+            |_| {},
         );
 
         assert!(result.unwrap_err().contains("abgebrochen"));

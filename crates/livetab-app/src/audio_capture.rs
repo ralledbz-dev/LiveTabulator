@@ -168,16 +168,16 @@ pub struct CaptureSession {
 }
 
 impl CaptureSession {
-    /// Zweck: Beginnt eine neue begrenzte Monoaufnahme aus den laufenden Captureframes.
+    /// Zweck: Beginnt eine neue begrenzte Monoaufnahme aus den laufenden Captureframes für WAV- oder MP3-Export.
     /// Eingaben: `self` – aktive Quelle; maximale Länge ist auf zehn Minuten begrenzt.
     /// Ausgabe: `Ok(())` oder ein verständlicher Fehler bei doppelter/leerer Session.
     pub fn begin_recording(&self) -> Result<(), String> {
         let mut recording = self
             .recording
             .lock()
-            .map_err(|_| "WAV-Aufnahmepuffer ist gesperrt.".to_string())?;
+            .map_err(|_| "Audio-Aufnahmepuffer ist gesperrt.".to_string())?;
         if recording.is_some() {
-            return Err("Eine WAV-Aufnahme läuft bereits.".into());
+            return Err("Eine Audioaufnahme läuft bereits.".into());
         }
         *recording = Some(Vec::with_capacity(
             (self.sample_rate as usize * 5).min(self.maximum_recording_samples),
@@ -186,24 +186,36 @@ impl CaptureSession {
         Ok(())
     }
 
-    /// Zweck: Beendet die laufende Pufferaufnahme und übergibt die Samples an den WAV-Writer.
+    /// Zweck: Beendet die laufende Pufferaufnahme und übergibt die Samples an den WAV-/MP3-Writer.
     /// Eingaben: `self` – aktive Capture-Session.
     /// Ausgabe: Mono-Samples und Capture-Rate oder eine verständliche Meldung ohne aktive Aufnahme.
     pub fn finish_recording(&self) -> Result<(Vec<f32>, u32), String> {
         let mut recording = self
             .recording
             .lock()
-            .map_err(|_| "WAV-Aufnahmepuffer ist gesperrt.".to_string())?;
+            .map_err(|_| "Audio-Aufnahmepuffer ist gesperrt.".to_string())?;
         let samples = recording
             .take()
-            .ok_or_else(|| "Es läuft gerade keine WAV-Aufnahme.".to_string())?;
+            .ok_or_else(|| "Es läuft gerade keine Audioaufnahme.".to_string())?;
         if samples.is_empty() {
-            return Err("Die WAV-Aufnahme enthält keine Samples.".into());
+            return Err("Die Audioaufnahme enthält keine Samples.".into());
         }
         Ok((samples, self.sample_rate))
     }
 
-    /// Zweck: Meldet, ob gegenwärtig Samples für einen WAV-Export gesammelt werden.
+    /// Zweck: Liefert für die UI einen Snapshot der tatsächlich gepufferten Aufnahmesamples.
+    /// Eingaben: `self` – aktive Capture-Session; die Obergrenze entspricht dem Zehn-Minuten-Limit.
+    /// Ausgabe: Aufgenommene Samples, maximale Samples und Sample-Rate oder `None` ohne aktive Aufnahme.
+    pub fn recording_progress_snapshot(&self) -> Option<(usize, usize, u32)> {
+        let recording = self.recording.lock().ok()?;
+        Some((
+            recording.as_ref()?.len(),
+            self.maximum_recording_samples,
+            self.sample_rate,
+        ))
+    }
+
+    /// Zweck: Meldet, ob gegenwärtig Samples für einen WAV- oder MP3-Export gesammelt werden.
     /// Eingaben: `self` – aktive Capture-Session.
     /// Ausgabe: `true`, solange ein Aufnahmepuffer aktiv ist.
     pub fn is_recording(&self) -> bool {
@@ -360,12 +372,12 @@ fn run_live_analyzer(
                             controller.observer().log(
                                 LogLevel::Warning,
                                 LogCategory::Audio,
-                                "Maximale 10-Minuten-Live-WAV-Aufnahme erreicht.",
+                                "Maximale 10-Minuten-Live-Audioaufnahme erreicht.",
                                 "Die bisherige Aufnahme kann gespeichert werden.",
                                 BTreeMap::new(),
                                 None,
                             );
-                            events.publish(AppEvent::Error { category: "WAV-Aufnahme".into(), message: "Die 10-Minuten-Grenze wurde erreicht; die bisherige Aufnahme ist weiterhin speicherbar.".into() });
+                            events.publish(AppEvent::Error { category: "Audioaufnahme".into(), message: "Die 10-Minuten-Grenze wurde erreicht; die bisherige Aufnahme ist weiterhin als WAV oder MP3 speicherbar.".into() });
                         }
                     }
                 }
@@ -729,6 +741,26 @@ fn float32_interleaved_to_mono(bytes: &[u8], channels: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Zweck: Prüft den Capturefortschritt anhand vorhandener Samples statt einer Zeitschätzung.
+    /// Eingaben: Synthetische Session mit 250 von 1.000 Samples; es werden keine Geräte gestartet.
+    /// Ausgabe: Keine Rückgabe; der Snapshot muss Samples, Grenze und Rate exakt wiedergeben.
+    #[test]
+    fn recording_progress_snapshot_reports_captured_samples() {
+        let session = CaptureSession {
+            stop: Arc::new(AtomicBool::new(false)),
+            workers: Vec::new(),
+            recording: Arc::new(Mutex::new(Some(vec![0.0; 250]))),
+            recording_limit_reached: Arc::new(AtomicBool::new(false)),
+            sample_rate: 100,
+            maximum_recording_samples: 1_000,
+        };
+
+        assert_eq!(
+            session.recording_progress_snapshot(),
+            Some((250, 1_000, 100))
+        );
+    }
 
     /// Zweck: Prüft stereo Float32-Downmix, Begrenzung und Behandlung von NaN.
     /// Eingaben: Vier interleaved Float32-Samples für zwei Stereo-Zeitpunkte.

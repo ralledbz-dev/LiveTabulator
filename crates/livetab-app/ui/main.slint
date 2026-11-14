@@ -24,6 +24,9 @@ export component MainWindow inherits Window {
 
     in-out property <string> status_text: "Bereit · lokale Verarbeitung";
     in-out property <string> audio_status_text: "Keine Audioquelle ausgewählt.";
+    in-out property <float> audio_progress: 0.0;
+    in-out property <bool> audio_progress_visible: false;
+    in-out property <string> audio_progress_text: "";
     in-out property <string> audio_device_status_text: "WASAPI = Systemmix · ASIO = Interfaceeingang (kein Systemton).";
     in-out property <[string]> audio_device_names: [];
     in-out property <string> worker_status_text: "Analyse-Worker bereit";
@@ -32,7 +35,7 @@ export component MainWindow inherits Window {
     in-out property <string> current_key_text: "Tonart offen";
     in-out property <string> bpm_text: "— BPM";
     in-out property <string> confidence_text: "Konfidenz —";
-    in-out property <string> waveform_text: "Noch keine Audioframes. Importiere eine WAV-Datei oder starte die Live-Aufnahme.";
+    in-out property <string> waveform_text: "Noch keine Audioframes. Importiere eine WAV-/MP3-Datei oder starte die Live-Aufnahme.";
     in-out property <string> chord_timeline_text: "Noch keine Akkordereignisse.";
     in-out property <string> beatgrid_text: "Beatgrid noch nicht berechnet.";
     in-out property <string> tab_text: "Noch keine Gitarrentabulatur.";
@@ -99,9 +102,9 @@ export component MainWindow inherits Window {
     // Eingaben: `device_name` – angezeigter aktiver Endpunkt.
     // Ausgabe: Kein Rückgabewert; die Quelle wird lokal gespeichert und beim nächsten Start geöffnet.
     callback audio_device_selected(string);
-    // Zweck: Beginnt oder beendet die begrenzte WAV-Aufzeichnung; Windows startet nach dem Speichern automatisch DSP-Analyse und Vier-Stem-Trennung.
-    // Eingaben: Keine; beim Beenden wird ein lokales WAV-Ziel ausgewählt.
-    // Ausgabe: Kein Rückgabewert; WAV-Speicherung, Offline-DSP und Windows-Stem-Worker laufen abbrechbar im Hintergrund.
+    // Zweck: Beginnt oder beendet die begrenzte WAV-/MP3-Aufzeichnung; Windows startet nach WAV-Speichern automatisch DSP-Analyse und Vier-Stem-Trennung.
+    // Eingaben: Keine; beim Beenden wird ein lokales WAV- oder MP3-Ziel ausgewählt.
+    // Ausgabe: Kein Rückgabewert; WAV-/MP3-Speicherung, Offline-DSP und Windows-Stem-Worker für WAV-Aufnahmen laufen abbrechbar im Hintergrund.
     callback toggle_recording_requested();
     // Zweck: Fordert das kontrollierte Beenden der Live-Aufnahme an.
     // Eingaben: Keine.
@@ -327,6 +330,19 @@ export component MainWindow inherits Window {
                             }
                         }
                         Text { text: root.audio_device_status_text; color: #858aa1; font-size: 9px; wrap: word-wrap; }
+                        if root.audio_progress_visible: VerticalLayout {
+                            spacing: 3px;
+                            Text { text: root.audio_progress_text; color: #88d9ee; font-size: 8px; wrap: word-wrap; }
+                            Rectangle {
+                                height: 4px;
+                                background: #293149;
+                                Rectangle {
+                                    width: parent.width * root.audio_progress;
+                                    height: parent.height;
+                                    background: #47c7dc;
+                                }
+                            }
+                        }
                         LineEdit { text <=> root.audio_path_text; enabled: !root.busy; }
                         HorizontalLayout {
                             spacing: 6px;
@@ -338,8 +354,8 @@ export component MainWindow inherits Window {
                                 clicked => { root.select_audio_requested(); }
                             }
                             Button {
-                                text: "WAV öffnen"; enabled: !root.busy;
-                                // Zweck: Importiert und prüft die eingetragene WAV-Audiodatei.
+                                text: "WAV/MP3 öffnen"; enabled: !root.busy;
+                                // Zweck: Importiert und prüft die eingetragene WAV-/MP3-Audiodatei.
                                 // Eingaben: Mausklick; Quellpfad stammt aus `audio_path_text`.
                                 // Ausgabe: Kein Rückgabewert; startet den Audioimport.
                                 clicked => { root.open_audio_requested(); }
@@ -365,7 +381,7 @@ export component MainWindow inherits Window {
                         }
                         Button {
                             horizontal-stretch: 1;
-                            text: root.recording ? (root.auto_stem_after_recording_available ? "WAV sichern · DSP + Stems" : "WAV sichern & analysieren") : "WAV aufnehmen";
+                            text: root.recording ? "Aufnahme sichern & analysieren" : "WAV/MP3 aufnehmen";
                             enabled: root.live_running && (!root.busy || root.recording);
                             // Zweck: Beginnt die Live-WAV-Pufferung oder öffnet beim Stoppen den Speichern-Dialog.
                             // Eingaben: Mausklick; Aufnahme endet spätestens nach zehn Minuten.

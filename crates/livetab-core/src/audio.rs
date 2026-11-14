@@ -2,7 +2,7 @@
 ===============================================================================
 Division By Zeros (DBZS) - Rust-Core-Audio
 Modul: audio
-Zweck: Sichere WAV-Ein-/Ausgabe, Framevalidierung, Pegelmessung und
+Zweck: Sichere WAV-/MP3-Ein-/Ausgabe, Framevalidierung, Pegelmessung und
        atomarer Single-Producer/Single-Consumer-Ringbuffer.
 Sprache: Rust
 Hinweise:
@@ -11,12 +11,22 @@ Hinweise:
 ===============================================================================
 */
 use std::fmt::{self, Display, Formatter};
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use symphonia::core::audio::SampleBuffer;
+use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
+use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
 
 const MAX_WAV_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_MP3_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_MP3_SAMPLES: usize = 512 * 1024 * 1024;
 
 /// Audiofehler beim Dekodieren, Erzeugen oder Puffern von Samples.
 #[derive(Debug)]
@@ -25,6 +35,8 @@ pub enum AudioError {
     Io(std::io::Error),
     /// RIFF-/WAVE-Struktur ist ungültig, unvollständig oder nicht unterstützt.
     InvalidWav(String),
+    /// MP3-Datenstrom ist ungültig, unvollständig oder nicht unterstützt.
+    InvalidMp3(String),
     /// Anzahl Kanäle, Sample-Rate oder Frameparameter sind ungültig.
     InvalidFormat(String),
 }
@@ -37,13 +49,14 @@ impl Display for AudioError {
         match self {
             Self::Io(error) => write!(f, "Audiodateizugriff fehlgeschlagen: {error}"),
             Self::InvalidWav(reason) => write!(f, "WAV-Datei ungültig: {reason}"),
+            Self::InvalidMp3(reason) => write!(f, "MP3-Datei ungültig: {reason}"),
             Self::InvalidFormat(reason) => write!(f, "Audioformat ungültig: {reason}"),
         }
     }
 }
 impl std::error::Error for AudioError {}
 
-/// Metadaten eines PCM- oder Float-WAV-Audiostroms.
+/// Metadaten des dekodierten PCM-Audiostroms aus WAV oder MP3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioFormat {
     pub sample_rate: u32,
@@ -52,7 +65,7 @@ pub struct AudioFormat {
     pub is_float: bool,
 }
 
-/// Dekodierte WAV-Daten; Samples liegen interleaved und im normierten Bereich vor.
+/// Dekodierte WAV-/MP3-Audiodaten; Samples liegen interleaved und im normierten Bereich vor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WaveFile {
     pub format: AudioFormat,
@@ -61,14 +74,14 @@ pub struct WaveFile {
 
 impl WaveFile {
     /// Zweck: Liefert die Anzahl vollständiger Sample-Frames.
-    /// Eingaben: `self` – WAV-Daten mit interleaved Kanalwerten.
+    /// Eingaben: `self` – dekodierte Audioquelle mit interleaved Kanalwerten.
     /// Ausgabe: Zahl der Zeitpunkte, jeweils über alle Kanäle.
     pub fn frame_count(&self) -> usize {
         self.samples.len() / usize::from(self.format.channels)
     }
 
     /// Zweck: Berechnet die Audiodauer anhand der Sample-Rate und vollständigen Frames.
-    /// Eingaben: `self` – WAV-Daten.
+    /// Eingaben: `self` – dekodierte WAV- oder MP3-Audiodaten.
     /// Ausgabe: Dauer in Sekunden oder `0.0`, falls die Sample-Rate ungültig wäre.
     pub fn duration_seconds(&self) -> f64 {
         if self.format.sample_rate == 0 {
@@ -79,7 +92,7 @@ impl WaveFile {
     }
 
     /// Zweck: Leitet ein Mono-Analyseriesignal durch Mittelung der Kanäle ab.
-    /// Eingaben: `self` – interleaved WAV-Samples.
+    /// Eingaben: `self` – interleaved WAV-/MP3-Samples.
     /// Ausgabe: Endliche Mono-Samplefolge; nichtendliche Eingaben werden als Stille behandelt.
     pub fn mono_samples(&self) -> Vec<f32> {
         let channels = usize::from(self.format.channels);
@@ -251,13 +264,36 @@ impl AudioRingBuffer {
 /// Eingaben: `path` – lokaler Dateipfad; Dateigröße wird vor dem Laden begrenzt.
 /// Ausgabe: Dekodierte interleaved Samples und Audioformat oder ein lesbarer WAV-/I/O-Fehler.
 pub fn read_wav(path: impl AsRef<Path>) -> Result<WaveFile, AudioError> {
-    let metadata = fs::metadata(path.as_ref()).map_err(AudioError::Io)?;
+    read_wav_with_progress(path.as_ref(), &mut |_| {})
+}
+
+/// Zweck: Dekodiert WAV und meldet Fortschritt anhand tatsächlich gelesener Bytes und konvertierter Samples.
+/// Eingaben: `path` – lokale WAV-Datei; `progress` – Callback mit monotonem Anteil von null bis eins.
+/// Ausgabe: Dekodierte interleaved Samples und Audioformat oder ein lesbarer WAV-/I/O-Fehler.
+fn read_wav_with_progress<F>(path: &Path, progress: &mut F) -> Result<WaveFile, AudioError>
+where
+    F: FnMut(f32),
+{
+    let metadata = fs::metadata(path).map_err(AudioError::Io)?;
     if metadata.len() == 0 || metadata.len() > MAX_WAV_BYTES {
         return Err(AudioError::InvalidWav(
             "Datei ist leer oder überschreitet die 2-GiB-Grenze.".into(),
         ));
     }
-    let bytes = fs::read(path).map_err(AudioError::Io)?;
+    let total_bytes = metadata.len() as usize;
+    let mut file = File::open(path).map_err(AudioError::Io)?;
+    let mut bytes = Vec::with_capacity(total_bytes);
+    let mut read_buffer = [0_u8; 64 * 1024];
+    let mut bytes_read = 0_usize;
+    loop {
+        let count = file.read(&mut read_buffer).map_err(AudioError::Io)?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&read_buffer[..count]);
+        bytes_read += count;
+        progress(0.4 * bytes_read.min(total_bytes) as f32 / total_bytes as f32);
+    }
     if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err(AudioError::InvalidWav("RIFF/WAVE-Kopf fehlt.".into()));
     }
@@ -321,7 +357,8 @@ pub fn read_wav(path: impl AsRef<Path>) -> Result<WaveFile, AudioError> {
         ));
     }
     let mut samples = Vec::with_capacity(data.len() / bytes_per_sample);
-    for sample in data.chunks_exact(bytes_per_sample) {
+    let total_samples = data.len() / bytes_per_sample;
+    for (index, sample) in data.chunks_exact(bytes_per_sample).enumerate() {
         let value = match (encoding, bits) {
             (1, 8) => (f32::from(sample[0]) - 128.0) / 128.0,
             (1, 16) => i16::from_le_bytes([sample[0], sample[1]]) as f32 / 32768.0,
@@ -341,13 +378,181 @@ pub fn read_wav(path: impl AsRef<Path>) -> Result<WaveFile, AudioError> {
         } else {
             0.0
         });
+        if index % 16_384 == 0 {
+            progress(0.4 + 0.6 * (index + 1) as f32 / total_samples as f32);
+        }
     }
+    progress(1.0);
     Ok(WaveFile {
         format: AudioFormat {
             sample_rate,
             channels,
             bits_per_sample: bits,
             is_float: encoding == 3,
+        },
+        samples,
+    })
+}
+
+/// Zweck: Öffnet eine lokale WAV- oder MP3-Datei über den einheitlichen Medienpfad.
+/// Eingaben: `path` – Datei mit `.wav`- oder `.mp3`-Endung; die Erkennung ignoriert Groß-/Kleinschreibung.
+/// Ausgabe: Interleaved, normalisierte Samples und Quellmetadaten oder ein formatbezogener Datei-/Dekodierfehler.
+pub fn read_audio(path: impl AsRef<Path>) -> Result<WaveFile, AudioError> {
+    read_audio_with_progress(path, |_| {})
+}
+
+/// Zweck: Dekodiert WAV oder MP3 und meldet echten Fortschritt des Datei-/Samplepfads.
+/// Eingaben: `path` – lokale WAV-/MP3-Datei; `progress` – Callback mit Anteil von null bis eins.
+/// Ausgabe: Interleaved Samples und Metadaten oder ein formatbezogener Datei-/Decoderfehler.
+pub fn read_audio_with_progress<F>(
+    path: impl AsRef<Path>,
+    mut progress: F,
+) -> Result<WaveFile, AudioError>
+where
+    F: FnMut(f32),
+{
+    let path = path.as_ref();
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) if extension.eq_ignore_ascii_case("wav") => {
+            read_wav_with_progress(path, &mut progress)
+        }
+        Some(extension) if extension.eq_ignore_ascii_case("mp3") => {
+            read_mp3_with_progress(path, &mut progress)
+        }
+        Some(extension) => Err(AudioError::InvalidFormat(format!(
+            "Dateiendung .{extension} wird nicht als Audiodatei unterstützt; erlaubt sind WAV und MP3."
+        ))),
+        None => Err(AudioError::InvalidFormat(
+            "Audiodatei besitzt keine unterstützte .wav- oder .mp3-Endung.".into(),
+        )),
+    }
+}
+
+/// Zweck: Dekodiert einen MP3-Datenstrom mit Symphonia in interleaved Float-Samples.
+/// Eingaben: `path` – lokale MP3-Datei bis 2 GiB; `progress` – Fortschritt aus dekodierten Paketbytes.
+/// Ausgabe: `WaveFile` mit MP3-Quellrate und Kanalzahl oder ein verständlicher Datei-/Format-/Decoderfehler.
+fn read_mp3_with_progress<F>(path: &Path, progress: &mut F) -> Result<WaveFile, AudioError>
+where
+    F: FnMut(f32),
+{
+    let metadata = fs::metadata(path).map_err(AudioError::Io)?;
+    if metadata.len() == 0 || metadata.len() > MAX_MP3_BYTES {
+        return Err(AudioError::InvalidMp3(
+            "Datei ist leer oder überschreitet die 2-GiB-Grenze.".into(),
+        ));
+    }
+    let source = File::open(path).map_err(AudioError::Io)?;
+    let stream = MediaSourceStream::new(Box::new(source), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("mp3");
+    let format_options = FormatOptions {
+        enable_gapless: true,
+        ..Default::default()
+    };
+    let probed = symphonia::default::get_probe()
+        .format(&hint, stream, &format_options, &MetadataOptions::default())
+        .map_err(|error| {
+            AudioError::InvalidMp3(format!("Format konnte nicht erkannt werden: {error}"))
+        })?;
+    let mut format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|track| track.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| AudioError::InvalidMp3("Kein dekodierbarer Audiotrack gefunden.".into()))?;
+    let track_id = track.id;
+    let codec_parameters = track.codec_params.clone();
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&codec_parameters, &DecoderOptions::default())
+        .map_err(|error| {
+            AudioError::InvalidMp3(format!("MP3-Decoder konnte nicht erstellt werden: {error}"))
+        })?;
+
+    let mut samples = Vec::new();
+    let mut sample_rate = None;
+    let mut channels = None;
+    let mut decoded_packet_bytes = 0_u64;
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(SymphoniaError::IoError(error))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(error) => {
+                return Err(AudioError::InvalidMp3(format!(
+                    "MP3-Paket konnte nicht gelesen werden: {error}"
+                )));
+            }
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = decoder.decode(&packet).map_err(|error| {
+            AudioError::InvalidMp3(format!("MP3-Paket konnte nicht dekodiert werden: {error}"))
+        })?;
+        let rate = decoded.spec().rate;
+        let channel_count = decoded.spec().channels.count();
+        if !(8_000..=192_000).contains(&rate) || channel_count == 0 || channel_count > 8 {
+            return Err(AudioError::InvalidMp3(format!(
+                "Nicht unterstütztes PCM-Ausgabeformat: {rate} Hz, {channel_count} Kanäle."
+            )));
+        }
+        let channel_count = channel_count as u16;
+        if sample_rate.is_some_and(|previous| previous != rate)
+            || channels.is_some_and(|previous| previous != channel_count)
+        {
+            return Err(AudioError::InvalidMp3(
+                "Formatwechsel innerhalb eines MP3-Datenstroms wird nicht unterstützt.".into(),
+            ));
+        }
+        sample_rate = Some(rate);
+        channels = Some(channel_count);
+
+        let mut decoded_samples =
+            SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
+        decoded_samples.copy_interleaved_ref(decoded);
+        let decoded_samples = decoded_samples.samples();
+        if decoded_samples.len() > MAX_MP3_SAMPLES.saturating_sub(samples.len()) {
+            return Err(AudioError::InvalidMp3(
+                "Dekodierte Audioausgabe überschreitet die 2-GiB-Sicherheitsgrenze.".into(),
+            ));
+        }
+        samples.extend(decoded_samples.iter().map(|sample| {
+            if sample.is_finite() {
+                sample.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            }
+        }));
+        decoded_packet_bytes = decoded_packet_bytes.saturating_add(packet.buf().len() as u64);
+        progress(
+            (decoded_packet_bytes.min(metadata.len()) as f32 / metadata.len() as f32)
+                .clamp(0.0, 1.0),
+        );
+    }
+
+    let (sample_rate, channels) = match (sample_rate, channels) {
+        (Some(sample_rate), Some(channels)) => (sample_rate, channels),
+        _ => {
+            return Err(AudioError::InvalidMp3(
+                "MP3 enthält keine dekodierbaren Audioframes.".into(),
+            ));
+        }
+    };
+    if samples.is_empty() || samples.len() % usize::from(channels) != 0 {
+        return Err(AudioError::InvalidMp3(
+            "Dekodierte MP3-Samples enthalten keinen vollständigen Audioframe.".into(),
+        ));
+    }
+    progress(1.0);
+    Ok(WaveFile {
+        format: AudioFormat {
+            sample_rate,
+            channels,
+            bits_per_sample: 32,
+            is_float: true,
         },
         samples,
     })
@@ -362,6 +567,22 @@ pub fn write_wav(
     sample_rate: u32,
     channels: u16,
 ) -> Result<(), AudioError> {
+    write_wav_with_progress(path, samples, sample_rate, channels, |_| {})
+}
+
+/// Zweck: Schreibt PCM-16-Bit-WAV in Datenblöcken und meldet tatsächlich geschriebene Samplebytes.
+/// Eingaben: Zielpfad, interleaved Samples, Sample-Rate, Kanalzahl und Fortschrittscallback.
+/// Ausgabe: `Ok(())` nach vollständigem RIFF/WAVE-Schreiben oder ein I/O-/Formatfehler.
+pub fn write_wav_with_progress<F>(
+    path: impl AsRef<Path>,
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+    mut progress: F,
+) -> Result<(), AudioError>
+where
+    F: FnMut(f32),
+{
     if sample_rate == 0
         || channels == 0
         || channels > 8
@@ -384,29 +605,42 @@ pub fn write_wav(
     let byte_rate = sample_rate
         .checked_mul(u32::from(channels) * 2)
         .ok_or_else(|| AudioError::InvalidFormat("Byte-Rate läuft über.".into()))?;
-    let mut bytes = Vec::with_capacity(riff_size + 8);
-    bytes.extend_from_slice(b"RIFF");
-    bytes.extend_from_slice(&(riff_size as u32).to_le_bytes());
-    bytes.extend_from_slice(b"WAVEfmt ");
-    bytes.extend_from_slice(&16u32.to_le_bytes());
-    bytes.extend_from_slice(&1u16.to_le_bytes());
-    bytes.extend_from_slice(&channels.to_le_bytes());
-    bytes.extend_from_slice(&sample_rate.to_le_bytes());
-    bytes.extend_from_slice(&byte_rate.to_le_bytes());
-    bytes.extend_from_slice(&(channels * 2).to_le_bytes());
-    bytes.extend_from_slice(&16u16.to_le_bytes());
-    bytes.extend_from_slice(b"data");
-    bytes.extend_from_slice(&(data_bytes as u32).to_le_bytes());
-    for value in samples {
-        let clean = if value.is_finite() {
-            value.clamp(-1.0, 1.0)
-        } else {
-            0.0
-        };
-        let pcm = (clean * 32767.0).round() as i16;
-        bytes.extend_from_slice(&pcm.to_le_bytes());
+    let mut header = Vec::with_capacity(44);
+    header.extend_from_slice(b"RIFF");
+    header.extend_from_slice(&(riff_size as u32).to_le_bytes());
+    header.extend_from_slice(b"WAVEfmt ");
+    header.extend_from_slice(&16u32.to_le_bytes());
+    header.extend_from_slice(&1u16.to_le_bytes());
+    header.extend_from_slice(&channels.to_le_bytes());
+    header.extend_from_slice(&sample_rate.to_le_bytes());
+    header.extend_from_slice(&byte_rate.to_le_bytes());
+    header.extend_from_slice(&(channels * 2).to_le_bytes());
+    header.extend_from_slice(&16u16.to_le_bytes());
+    header.extend_from_slice(b"data");
+    header.extend_from_slice(&(data_bytes as u32).to_le_bytes());
+
+    let mut file = File::create(path).map_err(AudioError::Io)?;
+    file.write_all(&header).map_err(AudioError::Io)?;
+    for (index, chunk) in samples.chunks(8_192).enumerate() {
+        let mut bytes = Vec::with_capacity(chunk.len() * 2);
+        for value in chunk {
+            let clean = if value.is_finite() {
+                value.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            let pcm = (clean * 32767.0).round() as i16;
+            bytes.extend_from_slice(&pcm.to_le_bytes());
+        }
+        file.write_all(&bytes).map_err(AudioError::Io)?;
+        let samples_written = ((index + 1) * 8_192).min(samples.len());
+        progress(samples_written as f32 / samples.len().max(1) as f32);
     }
-    fs::write(path, bytes).map_err(AudioError::Io)
+    file.flush().map_err(AudioError::Io)?;
+    if samples.is_empty() {
+        progress(1.0);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -422,11 +656,17 @@ mod tests {
         let path = dir.path().join("roundtrip.wav");
         let source = [0.5, -0.5, 0.25, -0.25];
         write_wav(&path, &source, 48_000, 2).unwrap();
-        let decoded = read_wav(&path).unwrap();
+        let mut progress = Vec::new();
+        let decoded = read_audio_with_progress(&path, |value| progress.push(value)).unwrap();
         assert_eq!(decoded.format.channels, 2);
         assert_eq!(decoded.frame_count(), 2);
         assert!((decoded.mono_samples()[0]).abs() < 0.001);
         assert!((decoded.duration_seconds() - 2.0 / 48_000.0).abs() < 1e-9);
+        assert!(
+            progress.windows(2).all(|values| values[0] <= values[1]),
+            "WAV-Fortschritt ist nicht monoton: {progress:?}"
+        );
+        assert_eq!(progress.last(), Some(&1.0));
     }
 
     /// Zweck: Prüft den Ringpuffer-Downmix und das nachvollziehbare Verwerfen alter Samples.
