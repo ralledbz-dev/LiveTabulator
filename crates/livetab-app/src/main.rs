@@ -2,6 +2,7 @@ mod app_workflows;
 #[cfg(windows)]
 mod asio_capture;
 mod audio_capture;
+mod audio_encoding;
 mod llama_runtime;
 mod playback_output;
 mod stem_workflow;

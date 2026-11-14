@@ -128,6 +128,22 @@ pub fn save_dbztab(project: &SongProject, path: impl AsRef<Path>) -> Result<(), 
         .as_ref()
         .filter(|audio| audio.is_file())
         .cloned();
+    let audio_entry_name = embedded_audio
+        .as_ref()
+        .map(|audio| -> Result<&'static str, String> {
+            let extension = audio
+                .extension()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| "Eingebettetes Audio benötigt `.wav` oder `.mp3`.".to_string())?;
+            if extension.eq_ignore_ascii_case("wav") {
+                Ok("audio/source.wav")
+            } else if extension.eq_ignore_ascii_case("mp3") {
+                Ok("audio/source.mp3")
+            } else {
+                Err("Eingebettetes Audio benötigt `.wav` oder `.mp3`.".into())
+            }
+        })
+        .transpose()?;
     let mut embedded_stems = Vec::with_capacity(project.stem_tracks.len());
     for track in &project.stem_tracks {
         if !track.file_path.is_file() {
@@ -143,9 +159,7 @@ pub fn save_dbztab(project: &SongProject, path: impl AsRef<Path>) -> Result<(), 
         }
         embedded_stems.push((track.id.clone(), track.file_path.clone()));
     }
-    portable.audio_path = embedded_audio
-        .as_ref()
-        .map(|_| PathBuf::from("audio/source.wav"));
+    portable.audio_path = audio_entry_name.map(PathBuf::from);
     for track in &mut portable.stem_tracks {
         track.file_path = PathBuf::from(format!("audio/stems/{}.wav", track.id));
     }
@@ -160,8 +174,11 @@ pub fn save_dbztab(project: &SongProject, path: impl AsRef<Path>) -> Result<(), 
         if metadata.len() > MAX_EMBEDDED_AUDIO_BYTES {
             return Err("Eingebettete Audiodatei überschreitet zwei GiB.".into());
         }
+        let entry_name = audio_entry_name
+            .as_deref()
+            .ok_or_else(|| "Eingebetteter Audioeintrag fehlt im Manifest.".to_string())?;
         archive
-            .start_file("audio/source.wav", options)
+            .start_file(entry_name, options)
             .map_err(|error| format!("Audioeintrag konnte nicht begonnen werden: {error}"))?;
         let mut audio = File::open(audio_path)
             .map_err(|error| format!("Audiodatei konnte nicht geöffnet werden: {error}"))?;
@@ -221,13 +238,15 @@ pub fn load_dbztab(
             ));
         }
     }
-    let has_audio = archive.file_names().any(|name| name == "audio/source.wav");
-    let audio_size = if has_audio {
+    let audio_entry_name = ["audio/source.mp3", "audio/source.wav"]
+        .into_iter()
+        .find(|entry_name| archive.file_names().any(|name| name == *entry_name));
+    let audio_size = if let Some(entry_name) = audio_entry_name {
         Some(
             archive
-                .by_name("audio/source.wav")
-                .map_err(|error| format!("Audioeintrag konnte nicht geprüft werden: {error}"))?
-                .size(),
+                .by_name(entry_name)
+                .map(|entry| entry.size())
+                .map_err(|error| format!("Audioeintrag konnte nicht geprüft werden: {error}"))?,
         )
     } else {
         None
@@ -239,9 +258,14 @@ pub fn load_dbztab(
         let destination = destination.as_ref().join("audio");
         fs::create_dir_all(&destination)
             .map_err(|error| format!("Audioziel konnte nicht angelegt werden: {error}"))?;
-        let audio_path = destination.join("source.wav");
+        let entry_name = audio_entry_name
+            .ok_or_else(|| "Eingebetteter Audioeintrag fehlt im Archiv.".to_string())?;
+        let file_name = Path::new(entry_name)
+            .file_name()
+            .ok_or_else(|| "Eingebetteter Audioeintrag besitzt keinen Dateinamen.".to_string())?;
+        let audio_path = destination.join(file_name);
         let input = archive
-            .by_name("audio/source.wav")
+            .by_name(entry_name)
             .map_err(|error| format!("Audioeintrag konnte nicht geöffnet werden: {error}"))?;
         let mut output = File::create(&audio_path)
             .map_err(|error| format!("Audioziel kann nicht geschrieben werden: {error}"))?;
@@ -452,6 +476,28 @@ mod tests {
         assert_eq!(loaded.duration_seconds, 4.0);
         assert!(loaded.audio_path.is_none());
         assert!(save_dbztab(&project, dir.path().join("wrong.zip")).is_err());
+    }
+
+    /// Zweck: Prüft, dass eingebettete MP3-Quelldaten im Projektarchiv ihre echte Dateiendung behalten.
+    /// Eingaben: Keine; speichert kurze MP3-Testbytes in einem temporären Projekt und lädt das Archiv erneut.
+    /// Ausgabe: Keine Rückgabe; Assertions sichern ZIP-Eintrag und extrahierten `.mp3`-Pfad.
+    #[test]
+    fn preserves_mp3_extension_in_portable_project_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.mp3");
+        std::fs::write(&source, b"synthetic MP3 test bytes").unwrap();
+        let archive_path = dir.path().join("with-audio.dbztab");
+        let mut project = SongProject::new("MP3 Archiv", "DBZS");
+        project.audio_path = Some(source);
+
+        save_dbztab(&project, &archive_path).unwrap();
+        let loaded = load_dbztab(&archive_path, dir.path().join("restored")).unwrap();
+
+        assert_eq!(
+            loaded.audio_path.as_deref().and_then(Path::extension),
+            Some(std::ffi::OsStr::new("mp3"))
+        );
+        assert!(loaded.audio_path.unwrap().is_file());
     }
 
     /// Zweck: Prüft das Einbetten und sichere Wiederherstellen aller vier Stem-WAVs.

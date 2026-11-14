@@ -108,3 +108,19 @@ Hält laufende Audioframes für Analyse und Anzeige bereit.
 - `AudioFrameAvailableEvent`
 - `AudioOverrunDetectedEvent`
 - `AudioCaptureErrorEvent`
+
+## WAV-/MP3-Datei- und Aufnahmeweg
+
+- WAV bleibt unverändert unterstützt. `.mp3` wird lokal mit Symphonia 0.5.5 dekodiert und als dieselbe `WaveFile`-PCM-Struktur an Projektmodell, Deep-Analyse, Waveform und nativen Playback-Ausgang übergeben. Dateiendungen werden ohne Beachtung der Groß-/Kleinschreibung ausgewertet; MP3-Quelldateien und dekodierte Ausgaben sind jeweils auf 2 GiB begrenzt.
+- Die Live-PCM-Aufnahme bleibt auf zehn Minuten begrenzt. Beim Speichern entscheidet die echte `.wav`- oder `.mp3`-Endung: WAV nutzt den bestehenden PCM-16-Bit-Writer; MP3 wird offline nach Ende der Aufnahme mit dem gebündelten LAME-Encoder als 192-kbit/s-CBR-Mono kodiert. Nicht unterstützte Encoder-Sampleraten führen zu einem sichtbaren Fehler und werden nicht als MP3/WAV falsch beschriftet.
+- `.dbztab` bettet neue WAV- und MP3-Quellen unter ihrer passenden Endung ein; der Loader liest weiterhin ältere Archive mit `audio/source.wav`.
+- Die Audiokarte zeigt Capturefortschritt aus tatsächlich gepufferten Samples relativ zum Zehn-Minuten-Limit. WAV-Import meldet gelesene Datei-Bytes und konvertierte PCM-Samples; MP3-Import meldet dekodierte Paketbytes. MP3-Aufnahme meldet LAME-Sampleblöcke und tatsächlich geschriebene Ausgabebytes; WAV meldet geschriebene PCM-Blöcke. Updates werden auf mindestens 0,5-Prozent-Schritte gedrosselt; nicht gemessene Analysejobs erhalten keinen Audioprozentbalken.
+- Implementierungsquellen: [Symphonia 0.5.5 – MP3-Demuxer/Decoder und gapless Option](https://docs.rs/symphonia/0.5.5/symphonia/), [mp3lame-encoder 0.3.0 – LAME-Aufnahmecodierung](https://docs.rs/mp3lame-encoder/0.3.0/mp3lame_encoder/), [mp3lame-sys 0.2.0 – gebündeltes statisches LAME 4.0](https://crates.io/crates/mp3lame-sys/0.2.0).
+- Lizenzhinweis für spätere Binärveröffentlichungen: LAME und `mp3lame-encoder` stehen unter LGPL-3.0. Eine ausgelieferte statisch gelinkte App muss die einschlägigen Lizenz-/Quellhinweise und die LGPL-Anforderungen an das Relinking mitliefern; diese Änderung erstellt oder veröffentlicht kein Installationspaket.
+- Validierung (Windows x64/MSVC 19.51, Rust/Cargo 1.95; Artefakte unter `.work/mp3-validation-2026-11-14`):
+  - `cargo +1.95-x86_64-pc-windows-msvc fmt --all -- --check` – bestanden.
+  - `cargo +1.95-x86_64-pc-windows-msvc test --locked -p livetab-core` – 58 bestanden, 0 fehlgeschlagen.
+  - `cargo +1.95-x86_64-pc-windows-msvc test --locked -p livetab-app audio_` – 6 bestanden, 10 gefiltert; enthält WAV-/MP3-Roundtrips, Encoder-/Decoderfortschritt und einen synthetischen Capture-Snapshottest.
+  - `cargo +1.95-x86_64-pc-windows-msvc check --locked -p livetab-app` – erfolgreich, einschließlich Slint-Codegenerierung; zwei nicht-fatale `dead_code`-Warnungen für `CaptureSession::is_recording` und `PlaybackOutputSession::position_seconds`.
+  - `cargo +1.95-x86_64-pc-windows-msvc build --locked -p livetab-app` – erfolgreich gelinkt; dieselben zwei Warnungen.
+  - Synthetische Tests starteten weder die App noch Capture oder Playback.
