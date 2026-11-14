@@ -10,6 +10,8 @@ mod stem_workflow;
 use crate::llama_runtime::LoadedModel;
 use livetab_core::AppController;
 use livetab_core::model_registry::{ModelRegistry, RegistrySnapshot};
+use livetab_core::model_registry::{DEFAULT_ASSISTANT_MODEL_FILE, DEFAULT_ASSISTANT_MODEL_ID};
+use livetab_core::project::sha256_local_file;
 use livetab_core::project::{ProjectRecord, ProjectStore};
 #[cfg(windows)]
 use rfd::FileDialog;
@@ -86,7 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(handle) = weak.upgrade() {
                 handle.set_busy(true);
                 handle.set_model_status_text(
-                    "llama.cpp lädt das lokale Modell im Hintergrund …".into(),
+                    "Manifestgröße und SHA-256 werden geprüft; danach lädt llama.cpp das lokale Modell …".into(),
                 );
             }
             start_runtime_worker(model_path, weak.clone(), Arc::clone(&runtime_state));
@@ -471,16 +473,11 @@ fn scan_summary(snapshot: &RegistrySnapshot) -> String {
 /// Eingaben: `snapshot` – Ergebnis eines Registry-Scans.
 /// Ausgabe: Eine UI-Zeichenkette mit höchstens 18 Einträgen und gegebenenfalls einem Restzähler.
 fn model_list_text(snapshot: &RegistrySnapshot) -> String {
-    if snapshot.entries.is_empty() {
-        return "Keine Modellartefakte erkannt. Geprüfte Wurzeln: App-Modelle und D:\\Models."
-            .into();
-    }
     let default_id = snapshot.assistant_model().map(|entry| entry.id.as_str());
-    let mut rows = snapshot
-        .entries
-        .iter()
-        .take(18)
-        .map(|entry| {
+    let mut rows = if snapshot.entries.is_empty() {
+        vec!["Keine Modellartefakte erkannt. Geprüfte Wurzeln: App-Modelle und D:\\Models.".into()]
+    } else {
+        snapshot.entries.iter().take(18).map(|entry| {
             let architecture = entry
                 .architecture
                 .as_deref()
@@ -500,14 +497,18 @@ fn model_list_text(snapshot: &RegistrySnapshot) -> String {
                 architecture,
                 entry.path.display()
             )
-        })
-        .collect::<Vec<_>>();
+        }).collect::<Vec<_>>()
+    };
     if snapshot.entries.len() > rows.len() {
         rows.push(format!(
             "… und {} weitere",
             snapshot.entries.len() - rows.len()
         ));
     }
+    let consumers = snapshot.consumers().into_iter().map(|consumer| {
+        format!("{:?}: {:?} · {}", consumer.capability, consumer.state, consumer.detail)
+    }).collect::<Vec<_>>().join("\n");
+    rows.push(format!("Verbraucherstatus:\n{consumers}"));
     rows.join("\n\n")
 }
 
@@ -520,7 +521,9 @@ fn start_runtime_worker(model_path: PathBuf, weak: Weak<MainWindow>, runtime_sta
         *state = Some(sender);
     }
     thread::spawn(move || {
-        let model = match LoadedModel::load(Path::new(&model_path)) {
+        let model = match verify_fixed_default_model(&model_path)
+            .and_then(|()| LoadedModel::load(Path::new(&model_path)))
+        {
             Ok(model) => model,
             Err(error) => {
                 if let Ok(mut state) = runtime_state.lock() {
@@ -589,6 +592,61 @@ fn start_runtime_worker(model_path: PathBuf, weak: Weak<MainWindow>, runtime_sta
     });
 }
 
+/// Zweck: Prüft Dateiname, feste Manifest-ID, deklarierte Größe und SHA-256 vor jeder Assistant-Laufzeit.
+/// Eingaben: Lokal ausgewählter GGUF-Pfad; das Manifest ist app-lokal eingebettet und verursacht keinen Netzwerkzugriff.
+/// Ausgabe: `Ok(())` nur für das fest konfigurierte Qwen3.5-4B-Q4_K_M oder eine erklärende Fehlermeldung.
+fn verify_fixed_default_model(path: &Path) -> Result<(), String> {
+    let manifest: serde_json::Value = serde_json::from_str(include_str!("../models/manifest.json"))
+        .map_err(|error| format!("Lokales Modellmanifest ist ungültig: {error}"))?;
+    let default_id = manifest
+        .get("default_model_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Modellmanifest nennt keine feste Default-ID.".to_string())?;
+    if default_id != DEFAULT_ASSISTANT_MODEL_ID {
+        return Err("Modellmanifest wählt nicht das festgelegte Qwen3.5-4B-Q4_K_M-Standardmodell.".into());
+    }
+    let models = manifest
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "Modellmanifest enthält keine Modellliste.".to_string())?;
+    let model = models
+        .iter()
+        .find(|model| model.get("id").and_then(serde_json::Value::as_str) == Some(default_id))
+        .ok_or_else(|| "Festes Qwen-Standardmodell fehlt im lokalen Manifest.".to_string())?;
+    let expected_filename = model
+        .get("filename")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Qwen-Manifest nennt keinen Dateinamen.".to_string())?;
+    if expected_filename != DEFAULT_ASSISTANT_MODEL_FILE
+        || path.file_name().and_then(|name| name.to_str()) != Some(DEFAULT_ASSISTANT_MODEL_FILE)
+    {
+        return Err("Der ausgewählte Modellpfad ist nicht die feste Qwen-Standarddatei.".into());
+    }
+    let expected_size = model
+        .get("size_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "Qwen-Manifest enthält keine gültige deklarierte Dateigröße.".to_string())?;
+    let expected_hash = model
+        .get("sha256")
+        .and_then(serde_json::Value::as_str)
+        .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| "Qwen-Manifest enthält keinen gültigen SHA-256-Hash.".to_string())?;
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("Qwen-Datei kann vor dem Laden nicht geprüft werden: {error}"))?;
+    if !metadata.is_file() || metadata.len() != expected_size {
+        return Err(format!(
+            "Qwen-Dateigröße stimmt nicht mit dem Manifest überein (erwartet {expected_size} Bytes, gefunden {} Bytes).",
+            metadata.len()
+        ));
+    }
+    let actual_hash = sha256_local_file(path)
+        .map_err(|error| format!("Qwen-SHA-256 konnte nicht geprüft werden: {error}"))?;
+    if !actual_hash.eq_ignore_ascii_case(expected_hash) {
+        return Err("Qwen-SHA-256 stimmt nicht mit dem lokalen Manifest überein; Laden wurde aus Sicherheitsgründen abgebrochen.".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,6 +707,15 @@ mod tests {
 
         assert!(status.contains("Import fehlgeschlagen"));
         assert!(status.contains("Endung .bandmap"));
+    }
+
+    /// Zweck: Prüft, dass die Runtime-Gate keine abweichende GGUF-Datei als Assistant-Ersatz akzeptiert.
+    /// Eingaben: Nicht existierender Pfad mit anderem Dateinamen; die Ablehnung erfolgt vor Dateizugriff.
+    /// Ausgabe: Keine Rückgabe; Assertion erwartet die feste Qwen-Standarddatei als Voraussetzung.
+    #[test]
+    fn runtime_gate_rejects_non_default_model_before_file_access() {
+        let error = verify_fixed_default_model(Path::new("replacement-model.gguf")).unwrap_err();
+        assert!(error.contains("feste Qwen-Standarddatei"));
     }
 }
 

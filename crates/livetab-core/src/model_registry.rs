@@ -1,3 +1,14 @@
+/*
+===============================================================================
+Division By Zeros (DBZS) - Lokale Modellregistry
+Modul: model_registry
+Zweck: Findet und validiert lokale Modelle und ordnet sie App-Verbrauchern zu.
+Sprache: Rust
+Hinweise:
+- Modellwurzeln werden rekursiv und ohne Netzwerkzugriff durchsucht.
+- Qwen3.5-4B-Q4_K_M bleibt der feste Assistant-Standard; andere Textmodelle ersetzen ihn nicht.
+===============================================================================
+*/
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::File;
@@ -8,8 +19,7 @@ use walkdir::WalkDir;
 
 pub const MODEL_PATHS_ENV: &str = "LIVETAB_MODEL_PATHS";
 pub const DEFAULT_ASSISTANT_MODEL_FILE: &str = "Qwen3.5-4B-Q4_K_M.gguf";
-#[cfg(test)]
-const DEFAULT_ASSISTANT_MODEL_ID: &str = "qwen3_5_4b_q4_k_m";
+pub const DEFAULT_ASSISTANT_MODEL_ID: &str = "qwen3_5_4b_q4_k_m";
 const GGUF_HEADER_BYTES: u64 = 24;
 const MAX_METADATA_KV: u64 = 1_000_000;
 const MAX_ARRAY_ITEMS: u64 = 1_000_000;

@@ -11,7 +11,7 @@ Hinweise:
 - Android/iOS verwenden eine lokale Eingabequelle und verlangen Betriebssystemfreigabe.
 ===============================================================================
 */
-use livetab_core::audio::AudioFrame;
+use livetab_core::audio::{AudioFrame, InterleavedAudioRingBuffer};
 use livetab_core::observability::{LogCategory, LogLevel};
 use livetab_core::{AppController, AppEvent};
 use std::collections::BTreeMap;
@@ -19,9 +19,7 @@ use std::collections::VecDeque;
 #[cfg(windows)]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(any(windows, target_os = "android", target_os = "ios"))]
-use std::sync::mpsc::TrySendError;
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -30,6 +28,15 @@ const LIVE_FRAME_SAMPLES: usize = 4096;
 const LIVE_HOP_SAMPLES: usize = 2048;
 const CAPTURE_CHANNEL_CAPACITY: usize = 8;
 const MAX_RECORDING_SECONDS: u64 = 600;
+const MAX_RECORDING_BYTES: usize = 256 * 1024 * 1024;
+
+/// Gemeinsame Capturemetadaten samt vorallokiertem Transport zum unabhängigen Analyseworker.
+#[derive(Clone)]
+struct CaptureConfiguration {
+    sample_rate: u32,
+    channels: u16,
+    transport: Arc<InterleavedAudioRingBuffer>,
+}
 
 #[cfg(windows)]
 #[derive(Clone, Debug)]
@@ -164,11 +171,12 @@ pub struct CaptureSession {
     recording: Arc<Mutex<Option<Vec<f32>>>>,
     recording_limit_reached: Arc<AtomicBool>,
     sample_rate: u32,
+    channels: u16,
     maximum_recording_samples: usize,
 }
 
 impl CaptureSession {
-    /// Zweck: Beginnt eine neue begrenzte Monoaufnahme aus den laufenden Captureframes für WAV- oder MP3-Export.
+    /// Zweck: Beginnt eine neue begrenzte Aufnahme und erhält alle Quellkanäle für WAV-/MP3-Export.
     /// Eingaben: `self` – aktive Quelle; maximale Länge ist auf zehn Minuten begrenzt.
     /// Ausgabe: `Ok(())` oder ein verständlicher Fehler bei doppelter/leerer Session.
     pub fn begin_recording(&self) -> Result<(), String> {
@@ -179,17 +187,19 @@ impl CaptureSession {
         if recording.is_some() {
             return Err("Eine Audioaufnahme läuft bereits.".into());
         }
-        *recording = Some(Vec::with_capacity(
-            (self.sample_rate as usize * 5).min(self.maximum_recording_samples),
-        ));
+        let initial_capacity = (self.sample_rate as usize)
+            .saturating_mul(usize::from(self.channels))
+            .saturating_mul(5)
+            .min(self.maximum_recording_samples);
+        *recording = Some(Vec::with_capacity(initial_capacity));
         self.recording_limit_reached.store(false, Ordering::Release);
         Ok(())
     }
 
     /// Zweck: Beendet die laufende Pufferaufnahme und übergibt die Samples an den WAV-/MP3-Writer.
     /// Eingaben: `self` – aktive Capture-Session.
-    /// Ausgabe: Mono-Samples und Capture-Rate oder eine verständliche Meldung ohne aktive Aufnahme.
-    pub fn finish_recording(&self) -> Result<(Vec<f32>, u32), String> {
+    /// Ausgabe: Interleaved Originalkanäle, Capture-Rate und Kanalzahl oder eine verständliche Meldung.
+    pub fn finish_recording(&self) -> Result<(Vec<f32>, u32, u16), String> {
         let mut recording = self
             .recording
             .lock()
@@ -200,17 +210,18 @@ impl CaptureSession {
         if samples.is_empty() {
             return Err("Die Audioaufnahme enthält keine Samples.".into());
         }
-        Ok((samples, self.sample_rate))
+        Ok((samples, self.sample_rate, self.channels))
     }
 
     /// Zweck: Liefert für die UI einen Snapshot der tatsächlich gepufferten Aufnahmesamples.
     /// Eingaben: `self` – aktive Capture-Session; die Obergrenze entspricht dem Zehn-Minuten-Limit.
-    /// Ausgabe: Aufgenommene Samples, maximale Samples und Sample-Rate oder `None` ohne aktive Aufnahme.
+    /// Ausgabe: Vollständige aufgenommene Frames, maximale Frames und Sample-Rate oder `None` ohne Aufnahme.
     pub fn recording_progress_snapshot(&self) -> Option<(usize, usize, u32)> {
         let recording = self.recording.lock().ok()?;
+        let channels = usize::from(self.channels);
         Some((
-            recording.as_ref()?.len(),
-            self.maximum_recording_samples,
+            recording.as_ref()?.len() / channels,
+            self.maximum_recording_samples / channels,
             self.sample_rate,
         ))
     }
@@ -249,8 +260,8 @@ impl Drop for CaptureSession {
 /// Eingaben: Klonbarer `AppController`; Aufnahmefehler werden im EventBus veröffentlicht.
 /// Ausgabe: Laufende `CaptureSession` oder verständliche Geräte-/Berechtigungs-/Workerfehlermeldung.
 pub fn start_capture(controller: AppController) -> Result<CaptureSession, String> {
+    controller.reset_live_analysis();
     let stop = Arc::new(AtomicBool::new(false));
-    let (audio_sender, audio_receiver) = mpsc::sync_channel::<Vec<f32>>(CAPTURE_CHANNEL_CAPACITY);
     let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
     let capture_stop = Arc::clone(&stop);
     let capture_events = controller.event_bus();
@@ -260,12 +271,7 @@ pub fn start_capture(controller: AppController) -> Result<CaptureSession, String
         .name("livetab-audio-capture".into())
         .spawn(move || {
             let worker_observer = capture_observer;
-            let result = run_platform_capture(
-                audio_sender,
-                Arc::clone(&capture_stop),
-                startup_sender,
-                capture_events.clone(),
-            );
+            let result = run_platform_capture(Arc::clone(&capture_stop), startup_sender, capture_events.clone());
             if let Err(message) = result {
                 worker_observer.log(
                     LogLevel::Error,
@@ -288,8 +294,8 @@ pub fn start_capture(controller: AppController) -> Result<CaptureSession, String
         })
         .map_err(|error| format!("Capture-Worker konnte nicht gestartet werden: {error}"))?;
 
-    let sample_rate = match startup_receiver.recv_timeout(Duration::from_secs(8)) {
-        Ok(Ok(rate)) => rate,
+    let configuration = match startup_receiver.recv_timeout(Duration::from_secs(8)) {
+        Ok(Ok(configuration)) => configuration,
         Ok(Err(message)) => {
             stop.store(true, Ordering::Release);
             let _ = capture_worker.join();
@@ -306,20 +312,23 @@ pub fn start_capture(controller: AppController) -> Result<CaptureSession, String
 
     let recording = Arc::new(Mutex::new(None));
     let recording_limit_reached = Arc::new(AtomicBool::new(false));
-    let maximum_recording_samples =
-        (sample_rate as usize).saturating_mul(MAX_RECORDING_SECONDS as usize);
+    let samples_per_second = (configuration.sample_rate as usize)
+        .saturating_mul(usize::from(configuration.channels));
+    let maximum_recording_samples = samples_per_second
+        .saturating_mul(MAX_RECORDING_SECONDS as usize)
+        .min(MAX_RECORDING_BYTES / std::mem::size_of::<f32>());
     let analyzer_controller = controller.clone();
     let analyzer_events = controller.event_bus();
     let analyzer_stop = Arc::clone(&stop);
-    let analyzer_worker = thread::Builder::new()
+    let analyzer_configuration = configuration.clone();
+    let analyzer_worker = match thread::Builder::new()
         .name("livetab-live-dsp".into())
         .spawn({
             let recording = Arc::clone(&recording);
             let limit_reached = Arc::clone(&recording_limit_reached);
             move || {
                 run_live_analyzer(
-                    audio_receiver,
-                    sample_rate,
+                    analyzer_configuration,
                     analyzer_stop,
                     analyzer_controller,
                     analyzer_events,
@@ -329,27 +338,31 @@ pub fn start_capture(controller: AppController) -> Result<CaptureSession, String
                 )
             }
         })
-        .map_err(|error| {
+    {
+        Ok(worker) => worker,
+        Err(error) => {
             stop.store(true, Ordering::Release);
-            format!("Live-DSP-Worker konnte nicht gestartet werden: {error}")
-        })?;
+            let _ = capture_worker.join();
+            return Err(format!("Live-DSP-Worker konnte nicht gestartet werden: {error}"));
+        }
+    };
 
     Ok(CaptureSession {
         stop,
         workers: vec![capture_worker, analyzer_worker],
         recording,
         recording_limit_reached,
-        sample_rate,
+        sample_rate: configuration.sample_rate,
+        channels: configuration.channels,
         maximum_recording_samples,
     })
 }
 
-/// Zweck: Verarbeitet bounded Capture-Pakete zu überlappenden Liveframes ohne die Quellcallback zu blockieren.
-/// Eingaben: Audiosample-Empfänger, Capture-Rate, Stoppflag, Controller und EventBus.
-/// Ausgabe: Keine; publiziert Audio-/Chord-Events und meldet verständliche DSP-Fehler.
+/// Zweck: Verarbeitet bounded Interleaved-Captureblöcke in getrennte Live-DSP- und Mehrkanal-Recorderpfade.
+/// Eingaben: Captureformat/Ring, Stoppflag, Controller/Eventbus und begrenzter Recorder-Samplepuffer.
+/// Ausgabe: Keine; publiziert DSP-/Transportmetriken und meldet echte Überläufe oder Framefehler.
 fn run_live_analyzer(
-    receiver: Receiver<Vec<f32>>,
-    sample_rate: u32,
+    configuration: CaptureConfiguration,
     stop: Arc<AtomicBool>,
     controller: AppController,
     events: livetab_core::EventBus,
@@ -358,42 +371,68 @@ fn run_live_analyzer(
     recording_limit_reached: Arc<AtomicBool>,
 ) {
     let mut buffered = VecDeque::with_capacity(LIVE_FRAME_SAMPLES * 4);
-    let mut start_sample = 0u64;
+    let mut buffer_start_sample = 0u64;
+    let mut expected_input_sample = None;
+    let mut last_transport_report = std::time::Instant::now();
+    let sample_rate = configuration.sample_rate;
+    let channels = usize::from(configuration.channels);
     while !stop.load(Ordering::Acquire) {
-        match receiver.recv_timeout(Duration::from_millis(12)) {
-            Ok(samples) => {
-                if let Ok(mut active) = recording.lock() {
-                    if let Some(output) = active.as_mut() {
-                        let remaining = maximum_recording_samples.saturating_sub(output.len());
-                        output.extend(samples.iter().take(remaining).copied());
-                        if samples.len() > remaining
-                            && !recording_limit_reached.swap(true, Ordering::AcqRel)
-                        {
-                            controller.observer().log(
-                                LogLevel::Warning,
-                                LogCategory::Audio,
-                                "Maximale 10-Minuten-Live-Audioaufnahme erreicht.",
-                                "Die bisherige Aufnahme kann gespeichert werden.",
-                                BTreeMap::new(),
-                                None,
-                            );
-                            events.publish(AppEvent::Error { category: "Audioaufnahme".into(), message: "Die 10-Minuten-Grenze wurde erreicht; die bisherige Aufnahme ist weiterhin als WAV oder MP3 speicherbar.".into() });
-                        }
-                    }
-                }
-                buffered.extend(samples);
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        let block = configuration.transport.read_available(4_096);
+        if block.samples.is_empty() {
+            thread::sleep(Duration::from_millis(2));
+            continue;
         }
+        let frame_count = block.frame_count();
+        if expected_input_sample.is_some_and(|expected| expected != block.first_frame_index) {
+            buffered.clear();
+            buffer_start_sample = block.first_frame_index;
+        } else if buffered.is_empty() {
+            buffer_start_sample = block.first_frame_index;
+        }
+        if let Ok(mut active) = recording.lock() {
+            if let Some(output) = active.as_mut() {
+                let remaining = maximum_recording_samples.saturating_sub(output.len());
+                let accepted = (remaining / channels * channels).min(block.samples.len());
+                output.extend(block.samples.iter().take(accepted).copied());
+                if accepted < block.samples.len()
+                    && !recording_limit_reached.swap(true, Ordering::AcqRel)
+                {
+                    controller.observer().log(
+                        LogLevel::Warning,
+                        LogCategory::Audio,
+                        "Die begrenzte Liveaufnahme hat ihre Speicher-/Zeitgrenze erreicht.",
+                        "Die bisherige Mehrkanalaufnahme kann gespeichert werden.",
+                        BTreeMap::new(),
+                        None,
+                    );
+                    events.publish(AppEvent::Error {
+                        category: "Audioaufnahme".into(),
+                        message: "Die Aufnahmegrenze wurde erreicht; die bisherige Aufnahme bleibt als WAV oder MP3 speicherbar.".into(),
+                    });
+                }
+            }
+        }
+        buffered.extend(block.samples.chunks_exact(channels).map(|frame| {
+            let (sum, count) = frame.iter().copied().fold((0.0_f32, 0_usize), |(sum, count), sample| {
+                if sample.is_finite() { (sum + sample, count + 1) } else { (sum, count) }
+            });
+            if count == 0 {
+                0.0
+            } else {
+                (sum / count as f32).clamp(-1.0, 1.0)
+            }
+        }));
+        expected_input_sample = Some(block.first_frame_index.saturating_add(frame_count as u64));
         while buffered.len() >= LIVE_FRAME_SAMPLES {
             let frame_samples = buffered
                 .iter()
                 .take(LIVE_FRAME_SAMPLES)
                 .copied()
                 .collect::<Vec<_>>();
+            let frame_start = buffer_start_sample;
             buffered.drain(..LIVE_HOP_SAMPLES);
-            match AudioFrame::new(sample_rate, start_sample, frame_samples).and_then(|frame| {
+            buffer_start_sample = buffer_start_sample.saturating_add(LIVE_HOP_SAMPLES as u64);
+            match AudioFrame::new(sample_rate, frame_start, frame_samples).and_then(|frame| {
                 controller
                     .process_live_frame(&frame)
                     .map(|_| frame)
@@ -416,7 +455,16 @@ fn run_live_analyzer(
                     });
                 }
             }
-            start_sample = start_sample.saturating_add(LIVE_HOP_SAMPLES as u64);
+        }
+        if last_transport_report.elapsed() >= Duration::from_millis(100) {
+            events.publish(AppEvent::AudioTransportMetrics {
+                sample_rate,
+                channels: configuration.channels,
+                queue_frames: configuration.transport.queued_frames(),
+                dropped_frames: configuration.transport.dropped_frames(),
+                input_frames_seen: configuration.transport.input_frames_seen(),
+            });
+            last_transport_report = std::time::Instant::now();
         }
     }
 }
@@ -426,9 +474,8 @@ fn run_live_analyzer(
 /// Ausgabe: `Ok(())` nach kontrolliertem Stopp oder ein verständlicher Treiber-/Capturefehler.
 #[cfg(windows)]
 fn run_platform_capture(
-    sender: SyncSender<Vec<f32>>,
     stop: Arc<AtomicBool>,
-    startup: SyncSender<Result<u32, String>>,
+    startup: SyncSender<Result<CaptureConfiguration, String>>,
     events: livetab_core::EventBus,
 ) -> Result<(), String> {
     let selected = SELECTED_WINDOWS_AUDIO_DEVICE
@@ -436,23 +483,111 @@ fn run_platform_capture(
         .and_then(|selected| selected.lock().ok().and_then(|device| device.clone()));
     match selected {
         Some(WindowsAudioDevice::Asio(label)) => {
-            crate::asio_capture::run_capture(sender, stop, startup, events, &label)
+            run_asio_capture_compat(stop, startup, events, &label)
         }
         Some(WindowsAudioDevice::Wasapi(name)) => {
-            run_wasapi_capture(sender, stop, startup, events, Some(name))
+            run_wasapi_capture(stop, startup, events, Some(name))
         }
-        None => run_wasapi_capture(sender, stop, startup, events, None),
+        None => run_wasapi_capture(stop, startup, events, None),
     }
 }
 
+/// Zweck: Überführt den bestehenden ASIO-Mono-Kanalvertrag in den neuen vorallokierten Ringpuffer.
+/// Eingaben: Stoppsignal, Capture-Handshake, Eventbus und validierter ASIO-Treibername.
+/// Ausgabe: Kontrollierter Streamstopp oder ein ASIO-/Transportfehler; der Adapter `asio_capture.rs` bleibt unverändert.
+#[cfg(windows)]
+fn run_asio_capture_compat(
+    stop: Arc<AtomicBool>,
+    startup: SyncSender<Result<CaptureConfiguration, String>>,
+    events: livetab_core::EventBus,
+    driver_label: &str,
+) -> Result<(), String> {
+    let (sample_sender, sample_receiver) = mpsc::sync_channel(CAPTURE_CHANNEL_CAPACITY);
+    let (asio_startup_sender, asio_startup_receiver) = mpsc::sync_channel(1);
+    let asio_stop = Arc::clone(&stop);
+    let asio_events = events.clone();
+    let label = driver_label.to_string();
+    let asio_worker = thread::Builder::new()
+        .name("livetab-asio-compat".into())
+        .spawn(move || {
+            crate::asio_capture::run_capture(
+                sample_sender,
+                asio_stop,
+                asio_startup_sender,
+                asio_events,
+                &label,
+            )
+        })
+        .map_err(|error| format!("ASIO-Kompatibilitätsworker konnte nicht gestartet werden: {error}"))?;
+    let sample_rate = match asio_startup_receiver.recv_timeout(Duration::from_secs(8)) {
+        Ok(Ok(sample_rate)) => sample_rate,
+        Ok(Err(message)) => {
+            let _ = asio_worker.join();
+            return Err(message);
+        }
+        Err(error) => {
+            stop.store(true, Ordering::Release);
+            let worker_result = asio_worker.join();
+            let worker_detail = match worker_result {
+                Ok(Ok(())) => String::new(),
+                Ok(Err(message)) => format!("; ASIO-Worker-Abschluss: {message}"),
+                Err(_) => "; ASIO-Worker ist beim Abbruch unerwartet beendet worden.".into(),
+            };
+            return Err(format!("ASIO-Quelle meldete sich nicht rechtzeitig: {error}{worker_detail}"));
+        }
+    };
+    let transport = match InterleavedAudioRingBuffer::new(sample_rate as usize * 2, 1) {
+        Ok(transport) => Arc::new(transport),
+        Err(error) => {
+            stop.store(true, Ordering::Release);
+            let _ = asio_worker.join();
+            return Err(format!("ASIO-Capturepuffer konnte nicht angelegt werden: {error}"));
+        }
+    };
+    let configuration = CaptureConfiguration {
+        sample_rate,
+        channels: 1,
+        transport,
+    };
+    if startup.send(Ok(configuration.clone())).is_err() {
+        stop.store(true, Ordering::Release);
+        let _ = asio_worker.join();
+        return Err("Capture-Start wurde vom Aufrufer abgebrochen.".into());
+    }
+
+    let mut transport_result = Ok(());
+    while !stop.load(Ordering::Acquire) {
+        match sample_receiver.recv_timeout(Duration::from_millis(8)) {
+            Ok(samples) => {
+                // Ein voller Ring verwirft das Paket und erhöht seine Drop-Metrik; der ASIO-Stream bleibt nichtblockierend.
+                if let Err(error) = configuration.transport.push_f32_interleaved(&samples) {
+                    transport_result = Err(format!("ASIO-Captureframe konnte nicht übertragen werden: {error}"));
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) if stop.load(Ordering::Acquire) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                transport_result = Err("ASIO-Audiokanal wurde unerwartet geschlossen.".into());
+                break;
+            }
+        }
+    }
+    stop.store(true, Ordering::Release);
+    let asio_result = asio_worker
+        .join()
+        .map_err(|_| "ASIO-Captureworker wurde unerwartet beendet.".to_string())?;
+    transport_result?;
+    asio_result
+}
+
 /// Zweck: Verarbeitet ausschließlich einen WASAPI-Render-Endpunkt als Windows-Systemaudio-Loopback.
-/// Eingaben: Bounded Sample-Kanal, Stoppflag, Start-Handshake, EventBus und optionaler Render-Endpunktname.
+/// Eingaben: Stoppflag, Capture-Handshake, EventBus und optionaler Render-Endpunktname; Samples gehen in den Interleaved-Ring.
 /// Ausgabe: `Ok(())` nach kontrolliertem Stopp oder ein Windows-Audiofehler.
 #[cfg(windows)]
 fn run_wasapi_capture(
-    sender: SyncSender<Vec<f32>>,
     stop: Arc<AtomicBool>,
-    startup: SyncSender<Result<u32, String>>,
+    startup: SyncSender<Result<CaptureConfiguration, String>>,
     events: livetab_core::EventBus,
     selected_name: Option<String>,
 ) -> Result<(), String> {
@@ -508,15 +643,30 @@ fn run_wasapi_capture(
     let sample_rate = format.get_samplespersec();
     let channels = usize::from(format.get_nchannels());
     let block_align = format.get_blockalign() as usize;
+    let channel_count = u16::try_from(channels)
+        .map_err(|_| "WASAPI meldet eine ungültige Kanalzahl.".to_string())?;
+    let transport = Arc::new(
+        InterleavedAudioRingBuffer::new(sample_rate as usize * 2, channel_count)
+            .map_err(|error| format!("WASAPI-Capturepuffer konnte nicht angelegt werden: {error}"))?,
+    );
+    let configuration = CaptureConfiguration {
+        sample_rate,
+        channels: channel_count,
+        transport,
+    };
     startup
-        .send(Ok(sample_rate))
+        .send(Ok(configuration.clone()))
         .map_err(|_| "Capture-Start wurde vom Aufrufer abgebrochen.".to_string())?;
     events.publish(AppEvent::AudioCaptureChanged {
         running: true,
-        source: format!("WASAPI-Loopback · {device_name}"),
+        source: format!("WASAPI-Loopback · {device_name} · {sample_rate} Hz · {channels} Kanal/Kanäle"),
     });
 
-    let mut dropped_packets = 0u64;
+    let packet_buffer_frames = (sample_rate as usize / 4).max(1);
+    let packet_buffer_bytes = packet_buffer_frames
+        .checked_mul(block_align)
+        .ok_or_else(|| "WASAPI-Paketpuffergröße läuft über.".to_string())?;
+    let mut packet_bytes = vec![0_u8; packet_buffer_bytes];
     while !stop.load(Ordering::Acquire) {
         let mut saw_packet = false;
         loop {
@@ -529,24 +679,26 @@ fn run_wasapi_capture(
             if frames == 0 {
                 break;
             }
-            let mut bytes = vec![0u8; frames as usize * block_align];
+            let required_bytes = (frames as usize)
+                .checked_mul(block_align)
+                .ok_or_else(|| "WASAPI-Paketgröße läuft über.".to_string())?;
+            if required_bytes > packet_bytes.len() {
+                return Err(format!(
+                    "WASAPI-Paket mit {} Frames überschreitet den vorallokierten Capturepuffer.",
+                    frames
+                ));
+            }
             let (frames_read, _buffer_info) =
-                capture.read_from_device(&mut bytes).map_err(|error| {
+                capture.read_from_device(&mut packet_bytes[..required_bytes]).map_err(|error| {
                     format!("WASAPI-Capturepuffer konnte nicht gelesen werden: {error}")
                 })?;
             let byte_count = (frames_read as usize)
                 .saturating_mul(block_align)
-                .min(bytes.len());
-            let samples = float32_interleaved_to_mono(&bytes[..byte_count], channels);
-            if !samples.is_empty() {
-                match sender.try_send(samples) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_)) => {
-                        dropped_packets = dropped_packets.saturating_add(1)
-                    }
-                    Err(TrySendError::Disconnected(_)) => break,
-                }
-            }
+                .min(required_bytes);
+            configuration
+                .transport
+                .push_f32_le_bytes(&packet_bytes[..byte_count])
+                .map_err(|error| format!("WASAPI-Captureframe konnte nicht übertragen werden: {error}"))?;
             saw_packet = true;
         }
         if !saw_packet {
@@ -560,33 +712,28 @@ fn run_wasapi_capture(
         running: false,
         source: "WASAPI-Loopback".into(),
     });
-    if dropped_packets > 0 {
-        events.publish(AppEvent::Error { category: "Audiopuffer".into(), message: format!("{dropped_packets} Live-Audiopakete wurden verworfen, damit die Wiedergabe nicht blockiert." ) });
-    }
     stop_result
 }
 
-/// Zweck: Verarbeitet nicht-Windows-Ziele ohne versehentlich das Mikrofon als Systemloopback auszugeben.
-/// Eingaben: Capturekanal, Stoppflag, Start-Handshake und EventBus.
+/// Zweck: Verarbeitet Android/iOS-Ziele ohne versehentlich das Mikrofon als Systemloopback auszugeben.
+/// Eingaben: Stoppflag, Start-Handshake und EventBus; Samples gehen über einen vorallokierten Interleaved-Ring.
 /// Ausgabe: Mobile Mikrofonaufnahme oder klarer Hinweis auf eine nicht integrierte Plattform.
 #[cfg(all(not(windows), any(target_os = "android", target_os = "ios")))]
 fn run_platform_capture(
-    sender: SyncSender<Vec<f32>>,
     stop: Arc<AtomicBool>,
-    startup: SyncSender<Result<u32, String>>,
+    startup: SyncSender<Result<CaptureConfiguration, String>>,
     events: livetab_core::EventBus,
 ) -> Result<(), String> {
-    run_cpal_capture(sender, stop, startup, events)
+    run_cpal_capture(stop, startup, events)
 }
 
-/// Zweck: Erfasst auf Android/iOS den freigegebenen Standard-Mikrofoneingang und normalisiert Samples zu Mono.
-/// Eingaben: Bounded Samplekanal, Stoppsignal, Start-Handshake und EventBus.
+/// Zweck: Erfasst auf Android/iOS den freigegebenen Standard-Mikrofoneingang und erhält dessen Quellkanäle.
+/// Eingaben: Stoppsignal, Start-Handshake und EventBus; Callback schreibt normalisierte Frames nichtblockierend in den Ring.
 /// Ausgabe: `Ok(())` nach Stopp oder ein Geräte-/Berechtigungsfehler.
 #[cfg(all(not(windows), any(target_os = "android", target_os = "ios")))]
 fn run_cpal_capture(
-    sender: SyncSender<Vec<f32>>,
     stop: Arc<AtomicBool>,
-    startup: SyncSender<Result<u32, String>>,
+    startup: SyncSender<Result<CaptureConfiguration, String>>,
     events: livetab_core::EventBus,
 ) -> Result<(), String> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -599,43 +746,37 @@ fn run_cpal_capture(
         .map_err(|error| format!("Mikrofonformat konnte nicht gelesen werden: {error}"))?;
     let sample_rate = supported.sample_rate().0;
     let channels = usize::from(supported.channels());
+    let channel_count = u16::try_from(channels)
+        .map_err(|_| "Das native Mikrofon meldet zu viele Kanäle.".to_string())?;
+    let transport = Arc::new(
+        InterleavedAudioRingBuffer::new(sample_rate as usize * 2, channel_count)
+            .map_err(|error| format!("Mikrofon-Capturepuffer konnte nicht angelegt werden: {error}"))?,
+    );
     let config: cpal::StreamConfig = supported.clone().into();
     let stream = match supported.sample_format() {
         cpal::SampleFormat::F32 => {
-            let output = sender.clone();
+            let output = Arc::clone(&transport);
             device.build_input_stream(
                 &config,
-                move |data: &[f32], _| try_send_mono(&output, data, channels),
+                move |data: &[f32], _| { let _ = output.push_f32_interleaved(data); },
                 move |error| eprintln!("local microphone error: {error}"),
                 None,
             )
         }
         cpal::SampleFormat::I16 => {
-            let output = sender.clone();
+            let output = Arc::clone(&transport);
             device.build_input_stream(
                 &config,
-                move |data: &[i16], _| {
-                    let converted = data
-                        .iter()
-                        .map(|value| *value as f32 / 32768.0)
-                        .collect::<Vec<_>>();
-                    try_send_mono(&output, &converted, channels)
-                },
+                move |data: &[i16], _| { let _ = output.push_i16_interleaved(data); },
                 move |error| eprintln!("local microphone error: {error}"),
                 None,
             )
         }
         cpal::SampleFormat::U16 => {
-            let output = sender.clone();
+            let output = Arc::clone(&transport);
             device.build_input_stream(
                 &config,
-                move |data: &[u16], _| {
-                    let converted = data
-                        .iter()
-                        .map(|value| (*value as f32 - 32768.0) / 32768.0)
-                        .collect::<Vec<_>>();
-                    try_send_mono(&output, &converted, channels)
-                },
+                move |data: &[u16], _| { let _ = output.push_u16_interleaved(data); },
                 move |error| eprintln!("local microphone error: {error}"),
                 None,
             )
@@ -650,12 +791,17 @@ fn run_cpal_capture(
     stream
         .play()
         .map_err(|error| format!("Mikrofonstream konnte nicht gestartet werden: {error}"))?;
+    let configuration = CaptureConfiguration {
+        sample_rate,
+        channels: channel_count,
+        transport,
+    };
     startup
-        .send(Ok(sample_rate))
+        .send(Ok(configuration))
         .map_err(|_| "Capture-Start wurde vom Aufrufer abgebrochen.".to_string())?;
     events.publish(AppEvent::AudioCaptureChanged {
         running: true,
-        source: "Mikrofon · lokale Eingabe".into(),
+        source: format!("Mikrofon · lokale Eingabe · {sample_rate} Hz · {channels} Kanal/Kanäle"),
     });
     while !stop.load(Ordering::Acquire) {
         thread::sleep(Duration::from_millis(20));
@@ -668,38 +814,13 @@ fn run_cpal_capture(
     Ok(())
 }
 
-/// Zweck: Wandelt plattformübergreifende interleaved Mono-/Multikanalsamples im cpal-Callback nichtblockierend um.
-/// Eingaben: Capture-Sender, interleaved Samplefolge und Kanalzahl.
-/// Ausgabe: Keine; bei vollem bounded Kanal werden ganze Pakete verworfen statt den Audiocallback zu blockieren.
-#[cfg(all(not(windows), any(target_os = "android", target_os = "ios")))]
-fn try_send_mono(sender: &SyncSender<Vec<f32>>, samples: &[f32], channels: usize) {
-    if channels == 0 || samples.len() % channels != 0 {
-        return;
-    }
-    let mono = samples
-        .chunks_exact(channels)
-        .map(|frame| {
-            frame
-                .iter()
-                .copied()
-                .filter(|sample| sample.is_finite())
-                .sum::<f32>()
-                / channels as f32
-        })
-        .collect::<Vec<_>>();
-    match sender.try_send(mono) {
-        Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
-    }
-}
-
 /// Zweck: Meldet auf nicht implementierten Desktopzielen einen klaren statt irreführenden Capturefehler.
-/// Eingaben: Capturekanal, Stoppsignal, Start-Handshake und EventBus.
+/// Eingaben: Stoppsignal und Start-Handshake; es wird keine Quelle geöffnet.
 /// Ausgabe: Immer ein beschreibender Fehler; es wird keine unbeabsichtigte Quelle geöffnet.
 #[cfg(all(not(windows), not(any(target_os = "android", target_os = "ios"))))]
 fn run_platform_capture(
-    _sender: SyncSender<Vec<f32>>,
     _stop: Arc<AtomicBool>,
-    startup: SyncSender<Result<u32, String>>,
+    startup: SyncSender<Result<CaptureConfiguration, String>>,
     _events: livetab_core::EventBus,
 ) -> Result<(), String> {
     let message = "Liveaufnahme ist in diesem Plattformprofil nicht integriert.".to_string();
@@ -707,79 +828,68 @@ fn run_platform_capture(
     Err(message)
 }
 
-/// Zweck: Dekodiert finite little-endian Float32-Frames und mittelt ihre Kanäle für den Mono-DSP.
-/// Eingaben: Interleaved Float32-Bytes und gültige Kanalzahl.
-/// Ausgabe: Mono-Samplefolge; unvollständige oder nichtendliche Werte werden verworfen/neutralisiert.
-fn float32_interleaved_to_mono(bytes: &[u8], channels: usize) -> Vec<f32> {
-    if channels == 0 || bytes.len() % 4 != 0 {
-        return Vec::new();
-    }
-    let values = bytes
-        .chunks_exact(4)
-        .map(|value| f32::from_ne_bytes([value[0], value[1], value[2], value[3]]))
-        .collect::<Vec<_>>();
-    if values.len() % channels != 0 {
-        return Vec::new();
-    }
-    values
-        .chunks_exact(channels)
-        .map(|frame| {
-            let finite = frame
-                .iter()
-                .copied()
-                .filter(|value| value.is_finite())
-                .collect::<Vec<_>>();
-            if finite.is_empty() {
-                0.0
-            } else {
-                (finite.iter().sum::<f32>() / channels as f32).clamp(-1.0, 1.0)
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Zweck: Prüft den Capturefortschritt anhand vorhandener Samples statt einer Zeitschätzung.
-    /// Eingaben: Synthetische Session mit 250 von 1.000 Samples; es werden keine Geräte gestartet.
-    /// Ausgabe: Keine Rückgabe; der Snapshot muss Samples, Grenze und Rate exakt wiedergeben.
+    /// Zweck: Prüft den Capturefortschritt anhand vorhandener Frames statt einer Zeitschätzung.
+    /// Eingaben: Synthetische Stereo-Session mit 125 von 500 Frames; es werden keine Geräte gestartet.
+    /// Ausgabe: Keine Rückgabe; der Snapshot muss Frames, Grenze und Rate exakt wiedergeben.
     #[test]
-    fn recording_progress_snapshot_reports_captured_samples() {
+    fn recording_progress_snapshot_reports_captured_frames() {
         let session = CaptureSession {
             stop: Arc::new(AtomicBool::new(false)),
             workers: Vec::new(),
             recording: Arc::new(Mutex::new(Some(vec![0.0; 250]))),
             recording_limit_reached: Arc::new(AtomicBool::new(false)),
             sample_rate: 100,
+            channels: 2,
             maximum_recording_samples: 1_000,
         };
 
         assert_eq!(
             session.recording_progress_snapshot(),
-            Some((250, 1_000, 100))
+            Some((125, 500, 100))
         );
     }
 
-    /// Zweck: Prüft stereo Float32-Downmix, Begrenzung und Behandlung von NaN.
-    /// Eingaben: Vier interleaved Float32-Samples für zwei Stereo-Zeitpunkte.
-    /// Ausgabe: Keine Rückgabe; Assertions sichern Monopegel und endliche Werte.
+    /// Zweck: Prüft, dass der Recorder die Originalkanäle beim Abschluss erhält.
+    /// Eingaben: Synthetische Stereo-Samples, Abtastrate und Kanalzahl; kein Gerät wird geöffnet.
+    /// Ausgabe: Keine Rückgabe; der Abschluss liefert unveränderte Interleaved-Samples und Metadaten.
     #[test]
-    fn loopback_downmixes_stereo_float_samples() {
-        let mut bytes = Vec::new();
-        for sample in [0.5f32, -0.5, 2.0, 0.0] {
-            bytes.extend_from_slice(&sample.to_ne_bytes());
-        }
-        assert_eq!(float32_interleaved_to_mono(&bytes, 2), vec![0.0, 1.0]);
+    fn finishing_capture_preserves_original_interleaved_channels() {
+        let samples = vec![0.5, -0.5, 0.25, 0.75];
+        let session = CaptureSession {
+            stop: Arc::new(AtomicBool::new(false)),
+            workers: Vec::new(),
+            recording: Arc::new(Mutex::new(Some(samples.clone()))),
+            recording_limit_reached: Arc::new(AtomicBool::new(false)),
+            sample_rate: 48_000,
+            channels: 2,
+            maximum_recording_samples: 8,
+        };
+
+        assert_eq!(
+            session.finish_recording().unwrap(),
+            (samples, 48_000, 2)
+        );
     }
 
-    /// Zweck: Verhindert Frames aus unvollständigen oder kanalinkonsistenten Capturepaketen.
-    /// Eingaben: Bytes mit einer unvollständigen float32- oder Stereo-Framegrenze.
-    /// Ausgabe: Keine Rückgabe; Assertions sichern fail-closed leere Ergebnisse.
+    /// Zweck: Weist einen leeren Recorderpuffer kontrolliert zurück.
+    /// Eingaben: Synthetische Session mit leerem Mehrkanalpuffer; es werden keine Geräte gestartet.
+    /// Ausgabe: Keine Rückgabe; der Abschluss muss einen verständlichen Fehler liefern.
     #[test]
-    fn capture_decoder_rejects_incomplete_frames() {
-        assert!(float32_interleaved_to_mono(&[0, 0, 0], 1).is_empty());
-        assert!(float32_interleaved_to_mono(&[0; 4], 2).is_empty());
+    fn finishing_capture_rejects_empty_recording() {
+        let session = CaptureSession {
+            stop: Arc::new(AtomicBool::new(false)),
+            workers: Vec::new(),
+            recording: Arc::new(Mutex::new(Some(Vec::new()))),
+            recording_limit_reached: Arc::new(AtomicBool::new(false)),
+            sample_rate: 48_000,
+            channels: 2,
+            maximum_recording_samples: 8,
+        };
+
+        assert!(session.finish_recording().is_err());
     }
 }

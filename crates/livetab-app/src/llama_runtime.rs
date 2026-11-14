@@ -1,3 +1,14 @@
+/*
+===============================================================================
+Division By Zeros (DBZS) - Lokale llama.cpp-Laufzeit
+Modul: llama_runtime
+Zweck: Lädt das festgelegte lokale GGUF-Modell und führt begrenzte Textinferenz aus.
+Sprache: Rust
+Hinweise:
+- Modell- und Inferenzarbeit laufen ausschließlich auf einem separaten Worker.
+- Der Live-Audiopfad und der Slint-Ereignisloop warten nicht auf llama.cpp.
+===============================================================================
+*/
 use llama_cpp_4::prelude::{
     AddBos, LlamaBackend, LlamaBatch, LlamaChatMessage, LlamaContextParams, LlamaModel,
     LlamaModelParams, LlamaSampler, Special,
@@ -9,8 +20,9 @@ use std::pin::pin;
 const CONTEXT_TOKENS: u32 = 2048;
 const MAX_GENERATED_TOKENS: usize = 128;
 
-/// Owns the backend and model on the dedicated runtime thread. Contexts are short-lived
-/// per request; no llama.cpp work is performed by the Slint event loop or an audio callback.
+/// Zweck: Hält Backend und fest validiertes Modell für einen dedizierten Runtime-Worker.
+/// Eingaben: Lokaler Modellpfad beim Laden; Prompts mit intern begrenzter Tokenzahl.
+/// Ausgabe: Modellstatistiken oder verständliche Fehler; kein Audio- oder UI-Thread arbeitet synchron mit.
 pub struct LoadedModel {
     backend: LlamaBackend,
     model: LlamaModel,
@@ -18,10 +30,16 @@ pub struct LoadedModel {
     gpu_layers: u32,
 }
 
+/// Zweck: Bewahrt die beobachtete lokale Antwort und gemessene Inferenzlaufzeit.
+/// Eingaben: Ausgabe des llama.cpp-Workers nach einer Inferenzanfrage.
+/// Ausgabe: Antworttext, tatsächlich erzeugte Tokens und verstrichene Zeit.
 #[derive(Debug)]
 pub struct GenerationStats {
+    /// Generierter Antworttext.
     pub text: String,
+    /// Tatsächlich dekodierte Ausgabetokens.
     pub generated_tokens: usize,
+    /// Vom Requeststart bis zum Antwortende gemessene Laufzeit.
     pub elapsed: std::time::Duration,
 }
 

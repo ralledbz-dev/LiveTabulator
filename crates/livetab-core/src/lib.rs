@@ -1,3 +1,14 @@
+/*
+===============================================================================
+Division By Zeros (DBZS) - LiveTabulator-Fachkern
+Modul: livetab_core
+Zweck: Bündelt validierte Musikmodelle, Timeline, lokale DSP-Analyse und Persistenz.
+Sprache: Rust
+Hinweise:
+- Der Fachkern bleibt plattformneutral und benötigt keine GUI- oder Cloud-Runtime.
+- Live-DSP und Projektlogik warten nicht auf den lokalen Sprachmodell-Worker.
+===============================================================================
+*/
 #![forbid(unsafe_code)]
 
 /// Zweck: Stellt lokale DSP-Analyse, Akkord-, Tonart-, Beat- und Notenerkennung bereit.
@@ -42,3 +53,6 @@ pub use event_bus::{AppEvent, EventBus};
 pub use project::{ProjectError, ProjectRecord, ProjectStore};
 pub use project_model::{SongProject, TabTrack};
 pub use song::{ChordEvent, LyricsWord, NoteEvent, Song, TabNote};
+/// Zweck: Vereinheitlicht Sekunden-, Viertelnoten-, Takt- und MIDI-Tick-Zeitachsen.
+pub mod timeline;
+pub use timeline::{MeterChange, TempoChange, TimelineMap};

@@ -34,6 +34,7 @@ pub fn generate_tab_track(
     tuning.validate()?;
     if notes.is_empty() {
         return Ok(TabTrack {
+            id: crate::song::next_event_id(),
             name: name.into(),
             tuning,
             notes: Vec::new(),
@@ -148,6 +149,7 @@ pub fn generate_tab_track(
         });
     }
     Ok(TabTrack {
+        id: crate::song::next_event_id(),
         name: name.into(),
         tuning,
         notes: fretted,

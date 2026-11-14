@@ -11,10 +11,13 @@ Hinweise:
 ===============================================================================
 */
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+const MAX_CONCURRENT_JOBS: usize = 4;
+const MAX_RETAINED_JOB_STATUSES: usize = 256;
 
 /// Kategorie eines Hintergrundjobs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +152,7 @@ pub struct JobManager {
     sender: Sender<JobEvent>,
     receiver: Mutex<Option<Receiver<JobEvent>>>,
     statuses: Arc<Mutex<BTreeMap<String, JobStatus>>>,
+    active_workers: Arc<AtomicUsize>,
 }
 
 impl JobManager {
@@ -162,6 +166,7 @@ impl JobManager {
             sender,
             receiver: Mutex::new(Some(receiver)),
             statuses: Arc::new(Mutex::new(BTreeMap::new())),
+            active_workers: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -189,6 +194,7 @@ impl JobManager {
         let statuses = Arc::clone(&self.statuses);
         let worker_sender = sender.clone();
         let worker_statuses = Arc::clone(&statuses);
+        let active_workers = Arc::clone(&self.active_workers);
         let job_id = id.clone();
         let queued = JobStatus {
             id: id.clone(),
@@ -198,11 +204,38 @@ impl JobManager {
             message: "Job wartet auf Ausführung.".into(),
             elapsed_ms: 0,
         };
-        if let Ok(mut all) = statuses.lock() {
-            all.insert(id.clone(), queued.clone());
-        }
+        store_status(&statuses, queued.clone());
         let _ = sender.send(JobEvent::Started(queued));
-        std::thread::spawn(move || {
+
+        if active_workers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_CONCURRENT_JOBS).then_some(active + 1)
+            })
+            .is_err()
+        {
+            let status = JobStatus {
+                id: id.clone(),
+                kind,
+                state: JobState::Failed,
+                progress: 0.0,
+                message: format!(
+                    "Maximal {MAX_CONCURRENT_JOBS} Hintergrundjobs laufen gleichzeitig; dieser Auftrag wurde abgewiesen."
+                ),
+                elapsed_ms: 0,
+            };
+            store_status(&statuses, status.clone());
+            let _ = sender.send(JobEvent::Failed(status));
+            return JobHandle {
+                id,
+                cancellation: token,
+            };
+        }
+
+        let failure_sender = sender.clone();
+        let worker_active_workers = Arc::clone(&active_workers);
+        let spawn_result = std::thread::Builder::new()
+            .name(format!("livetab-{}", job_id))
+            .spawn(move || {
             let started = Instant::now();
             let reporter = JobReporter {
                 id: job_id.clone(),
@@ -219,9 +252,7 @@ impl JobManager {
                 message: "Job gestartet.".into(),
                 elapsed_ms: 0,
             };
-            if let Ok(mut all) = worker_statuses.lock() {
-                all.insert(job_id.clone(), running.clone());
-            }
+            store_status(&worker_statuses, running.clone());
             let _ = worker_sender.send(JobEvent::Progress(running));
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 work(reporter, worker_token.clone())
@@ -247,9 +278,7 @@ impl JobManager {
                 message,
                 elapsed_ms: started.elapsed().as_millis(),
             };
-            if let Ok(mut all) = worker_statuses.lock() {
-                all.insert(job_id, status.clone());
-            }
+            store_status(&worker_statuses, status.clone());
             let event = match state {
                 JobState::Succeeded => JobEvent::Completed(status),
                 JobState::Failed => JobEvent::Failed(status),
@@ -257,7 +286,21 @@ impl JobManager {
                 _ => return,
             };
             let _ = worker_sender.send(event);
+            worker_active_workers.fetch_sub(1, Ordering::AcqRel);
         });
+        if let Err(error) = spawn_result {
+            active_workers.fetch_sub(1, Ordering::AcqRel);
+            let status = JobStatus {
+                id: id.clone(),
+                kind,
+                state: JobState::Failed,
+                progress: 0.0,
+                message: format!("Hintergrundjob konnte nicht gestartet werden: {error}"),
+                elapsed_ms: 0,
+            };
+            store_status(&statuses, status.clone());
+            let _ = failure_sender.send(JobEvent::Failed(status));
+        }
         JobHandle {
             id,
             cancellation: token,
@@ -279,6 +322,31 @@ impl JobManager {
             .lock()
             .map(|all| all.values().cloned().collect())
             .unwrap_or_default()
+    }
+}
+
+/// Zweck: Speichert einen Jobstatus und begrenzt die Historie auf abgeschlossene Einträge.
+/// Eingaben: Gemeinsame Statusmap und neuester Status eines Jobs.
+/// Ausgabe: Keine; aktive Jobs bleiben erhalten, terminale Historie wächst höchstens bis zum Limit.
+fn store_status(statuses: &Arc<Mutex<BTreeMap<String, JobStatus>>>, status: JobStatus) {
+    let Ok(mut all) = statuses.lock() else {
+        return;
+    };
+    all.insert(status.id.clone(), status);
+    while all.len() > MAX_RETAINED_JOB_STATUSES {
+        let oldest_terminal = all
+            .iter()
+            .find(|(_, value)| {
+                matches!(
+                    &value.state,
+                    &JobState::Succeeded | &JobState::Failed | &JobState::Cancelled
+                )
+            })
+            .map(|(id, _)| id.clone());
+        let Some(id) = oldest_terminal else {
+            break;
+        };
+        all.remove(&id);
     }
 }
 

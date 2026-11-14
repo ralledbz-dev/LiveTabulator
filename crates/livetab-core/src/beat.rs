@@ -160,6 +160,7 @@ fn build_grid(
     let count = ((duration_seconds - offset_seconds).max(0.0) / beat_duration).floor() as usize + 1;
     let beats = (0..count)
         .map(|index| BeatEvent {
+            id: crate::song::next_event_id(),
             time_seconds: offset_seconds + index as f64 * beat_duration,
             is_downbeat: index % usize::from(time_signature.beats_per_bar()) == 0,
             confidence,

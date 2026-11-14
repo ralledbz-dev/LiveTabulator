@@ -12,7 +12,43 @@ use crate::domain::{
     validate_confidence, validate_time_range,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_EVENT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Zweck: Liefert eine auf `u64` begrenzte Unix-Millisekundenzahl für lokale Event-IDs.
+/// Eingaben: Keine; liest die Systemuhr und verwendet bei Uhrfehlern null Dauer.
+/// Ausgabe: Nichtnegative Millisekunden seit Unix-Epoch.
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+/// Zweck: Reserviert die globale ID-Sequenz hinter allen bereits geladenen Projektevents.
+/// Eingaben: Größte im Projekt gespeicherte Ereignis-ID.
+/// Ausgabe: Keine; spätere neu erzeugte IDs liegen oberhalb der geladenen IDs.
+pub(crate) fn reserve_event_ids_after(maximum_id: u64) {
+    NEXT_EVENT_ID.fetch_max(maximum_id.saturating_add(1), Ordering::AcqRel);
+}
+
+/// Zweck: Erzeugt eine monoton steigende Ereignis-ID mit Zeitanteil für stabile lokale Identität.
+/// Eingaben: Keine; liest die Systemzeit und aktualisiert einen atomaren Zähler.
+/// Ausgabe: Nichtnull-ID, die im laufenden Prozess nicht wiederverwendet wird.
+pub(crate) fn next_event_id() -> u64 {
+    let time_floor = unix_time_ms().saturating_mul(65_536).max(1);
+    let mut current = NEXT_EVENT_ID.load(Ordering::Relaxed);
+    loop {
+        let next = current.max(time_floor).saturating_add(1);
+        match NEXT_EVENT_ID.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(observed) => current = observed,
+        }
+    }
+}
 
 /// Song-Metadaten und zugehörige Akkordereignisse.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -144,6 +180,9 @@ impl Song {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChordEvent {
+    /// Über Speichern/Wiederöffnen stabile lokale Ereignis-ID.
+    #[serde(default = "next_event_id")]
+    id: u64,
     chord: Chord,
     #[serde(rename = "start")]
     start_seconds: f64,
@@ -169,14 +208,35 @@ impl ChordEvent {
         end_seconds: f64,
         confidence: f32,
     ) -> Result<Self, DomainError> {
+        Self::with_event_id(next_event_id(), chord, start_seconds, end_seconds, confidence)
+    }
+
+    /// Zweck: Erstellt oder rekonstruiert ein Akkordereignis unter Erhalt einer vorhandenen ID.
+    /// Eingaben: Ereignis-ID, Akkord, Zeitgrenzen und Konfidenz.
+    /// Ausgabe: Validiertes Ereignis mit stabiler ID oder Domänenfehler.
+    pub fn with_event_id(
+        id: u64,
+        chord: Chord,
+        start_seconds: f64,
+        end_seconds: f64,
+        confidence: f32,
+    ) -> Result<Self, DomainError> {
         validate_time_range(start_seconds, end_seconds)?;
         validate_confidence(confidence)?;
         Ok(Self {
+            id,
             chord,
             start_seconds,
             end_seconds,
             confidence,
         })
+    }
+
+    /// Zweck: Liefert die stabile ID dieses Akkordereignisses.
+    /// Eingaben: `self` – Akkordereignis.
+    /// Ausgabe: Nichtnull-ID, die sich bei inhaltlicher Korrektur nicht ändert.
+    pub fn id(self) -> u64 {
+        self.id
     }
 
     /// Zweck: Liefert den Akkord des Ereignisses.
@@ -230,6 +290,9 @@ impl ChordEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NoteEvent {
+    /// Über Speichern/Wiederöffnen stabile lokale Ereignis-ID.
+    #[serde(default = "next_event_id")]
+    id: u64,
     pitch: String,
     midi: u8,
     #[serde(rename = "start")]
@@ -258,6 +321,20 @@ impl NoteEvent {
         velocity: u8,
         confidence: f32,
     ) -> Result<Self, DomainError> {
+        Self::with_metadata_and_id(next_event_id(), midi, start_seconds, duration_seconds, velocity, confidence)
+    }
+
+    /// Zweck: Erstellt oder korrigiert ein Notenereignis unter Erhalt seiner bisherigen ID.
+    /// Eingaben: Ereignis-ID, MIDI-Nummer, Zeit, Dauer, Velocity und Konfidenz.
+    /// Ausgabe: Validiertes Notenereignis oder Domänenfehler.
+    pub fn with_metadata_and_id(
+        id: u64,
+        midi: u8,
+        start_seconds: f64,
+        duration_seconds: f64,
+        velocity: u8,
+        confidence: f32,
+    ) -> Result<Self, DomainError> {
         if midi > 127 {
             return Err(DomainError::MidiOutOfRange);
         }
@@ -273,6 +350,7 @@ impl NoteEvent {
             i16::from(midi) / 12 - 1
         );
         Ok(Self {
+            id,
             pitch,
             midi,
             start_seconds,
@@ -280,6 +358,13 @@ impl NoteEvent {
             velocity,
             confidence,
         })
+    }
+
+    /// Zweck: Liefert die stabile ID dieses Notenereignisses.
+    /// Eingaben: `self` – Notenereignis.
+    /// Ausgabe: Nichtnull-ID des kanonischen Ereignisses.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Zweck: Liefert die MIDI-Notennummer.
@@ -357,6 +442,9 @@ impl NoteEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LyricsWord {
+    /// Über Speichern/Wiederöffnen stabile lokale Ereignis-ID.
+    #[serde(default = "next_event_id")]
+    id: u64,
     text: String,
     #[serde(rename = "start")]
     start_seconds: f64,
@@ -386,6 +474,19 @@ impl LyricsWord {
         end_seconds: f64,
         confidence: f32,
     ) -> Result<Self, DomainError> {
+        Self::with_confidence_and_id(next_event_id(), text, start_seconds, end_seconds, confidence)
+    }
+
+    /// Zweck: Erstellt oder bearbeitet ein Wort unter Beibehaltung einer vorhandenen ID.
+    /// Eingaben: Ereignis-ID, sichtbarer Text, Zeitgrenzen und Konfidenz.
+    /// Ausgabe: Validiertes Wortereignis oder Domänenfehler.
+    pub fn with_confidence_and_id(
+        id: u64,
+        text: impl Into<String>,
+        start_seconds: f64,
+        end_seconds: f64,
+        confidence: f32,
+    ) -> Result<Self, DomainError> {
         let text = text.into();
         if text.trim().is_empty() {
             return Err(DomainError::EmptyText);
@@ -393,11 +494,19 @@ impl LyricsWord {
         validate_time_range(start_seconds, end_seconds)?;
         validate_confidence(confidence)?;
         Ok(Self {
+            id,
             text,
             start_seconds,
             end_seconds,
             confidence,
         })
+    }
+
+    /// Zweck: Liefert die stabile ID dieses Lyrics-Worts.
+    /// Eingaben: `self` – Wortereignis.
+    /// Ausgabe: Nichtnull-ID des wortgenauen Zeitsegments.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Zweck: Liefert den transkribierten Worttext.
@@ -444,6 +553,9 @@ impl LyricsWord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TabNote {
+    /// Über Speichern/Wiederöffnen stabile lokale Ereignis-ID.
+    #[serde(default = "next_event_id")]
+    id: u64,
     #[serde(rename = "string")]
     string_number: u8,
     fret: u8,
@@ -464,18 +576,39 @@ impl TabNote {
         start_seconds: f64,
         duration_seconds: f64,
     ) -> Result<Self, DomainError> {
+        Self::with_event_id(next_event_id(), string_number, fret, start_seconds, duration_seconds)
+    }
+
+    /// Zweck: Erstellt oder bearbeitet eine Tabnote unter Erhalt einer vorhandenen ID.
+    /// Eingaben: Ereignis-ID, einsbasierte Saite, Bund, Startzeit und Dauer.
+    /// Ausgabe: Validierte Tabnote oder `InvalidStringNumber`/`InvalidTimeRange`.
+    pub fn with_event_id(
+        id: u64,
+        string_number: u8,
+        fret: u8,
+        start_seconds: f64,
+        duration_seconds: f64,
+    ) -> Result<Self, DomainError> {
         if string_number == 0 {
             return Err(DomainError::InvalidStringNumber);
         }
         let end_seconds = start_seconds + duration_seconds;
         validate_time_range(start_seconds, end_seconds)?;
         Ok(Self {
+            id,
             string_number,
             fret,
             start_seconds,
             duration_seconds,
             technique: None,
         })
+    }
+
+    /// Zweck: Liefert die stabile ID dieser Tabnote.
+    /// Eingaben: `self` – Tabulatur-Note.
+    /// Ausgabe: Nichtnull-ID zur Verknüpfung mit Projekt-Provenance.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Zweck: Setzt eine optionale Spieltechnik wie Hammer-on, Pull-off oder Slide.

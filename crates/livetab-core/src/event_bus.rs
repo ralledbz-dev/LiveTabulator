@@ -12,6 +12,7 @@ Hinweise:
 */
 use crate::project_model::BeatEvent;
 use crate::song::ChordEvent;
+use crate::song::NoteEvent;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -20,11 +21,44 @@ use std::sync::{Arc, Mutex};
 pub enum AppEvent {
     /// Audioaufnahme wurde gestartet oder beendet.
     AudioCaptureChanged { running: bool, source: String },
+    /// Gemessener Zustand des bounded Capture-Transports, nicht eine zeitbasierte Schätzung.
+    AudioTransportMetrics {
+        /// Tatsächliche Capture-Samplerate in Hertz.
+        sample_rate: u32,
+        /// Tatsächliche Zahl erhaltener Quellkanäle.
+        channels: u16,
+        /// Zum Messzeitpunkt noch gepufferte vollständige Frames.
+        queue_frames: usize,
+        /// Seit Sessionstart verworfene Quellframes.
+        dropped_frames: u64,
+        /// Alle bis zur Messung gesehenen Quellframes einschließlich verworfener.
+        input_frames_seen: u64,
+    },
     /// Neue Pegel- und Waveformmessung.
     AudioLevel {
         rms: f32,
         peak: f32,
         waveform: String,
+    },
+    /// Geglättete monophone Pitchmessung; fehlende Werte bedeuten keine sichere Schätzung.
+    LivePitch {
+        /// Samplezeitpunkt ab Aufnahmebeginn in Sekunden.
+        time_seconds: f64,
+        /// Erkannte MIDI-Tonhöhe oder `None` bei Stille/Mehrdeutigkeit.
+        midi: Option<u8>,
+        /// Grundfrequenz in Hertz oder `None` bei fehlendem Pitch.
+        frequency_hz: Option<f32>,
+        /// Periodizitätskonfidenz der stabilisierten Schätzung.
+        confidence: f32,
+    },
+    /// Neue oder verlängerte kanonische Live-Note mit stabiler Event-ID.
+    NoteDetected(NoteEvent),
+    /// Geglättete Rangfolge möglicher Tonarten aus mehreren Liveframes.
+    LiveKeyCandidates {
+        /// Höchstens drei lesbare Dur-/Moll-Kandidaten mit Rangreihenfolge.
+        alternatives: Vec<String>,
+        /// Korrelationskonfidenz des besten Kandidaten.
+        confidence: f32,
     },
     /// Neuer analysierter oder korrigierter Akkord.
     ChordDetected(ChordEvent),

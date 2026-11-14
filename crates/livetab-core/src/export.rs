@@ -12,14 +12,34 @@ Hinweise:
 */
 use crate::lyrics::{export_lrc, export_srt};
 use crate::project_model::SongProject;
-use std::fs::{self, File};
-use std::io::Read;
+use crate::timeline::{MAX_TIMELINE_TICKS, TimelineMap};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 const MAX_PROJECT_JSON_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_EMBEDDED_AUDIO_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_MIDI_EVENTS: usize = 1_000_000;
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+struct TemporaryOutputFile {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl Drop for TemporaryOutputFile {
+/// Zweck: Entfernt eine nicht abgeschlossene temporäre Ausgabedatei.
+    /// Eingaben: `self` – temporärer Dateipfad und Commit-Status.
+    /// Ausgabe: Keine; Aufräumfehler verändern niemals die bestehende Zieldatei.
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
 
 /// Zweck: Erzeugt eine lesbare Textübersicht aller editierbaren Songdaten.
 /// Eingaben: Validiertes oder im Arbeitsspeicher bearbeitetes `SongProject`.
@@ -82,22 +102,17 @@ pub fn export_project(
             .map_err(|error| format!("Exportordner konnte nicht erstellt werden: {error}"))?;
     }
     match format.to_ascii_lowercase().as_str() {
-        "txt" => fs::write(path, export_text(project))
-            .map_err(|error| format!("TXT-Export fehlgeschlagen: {error}"))?,
-        "lrc" => fs::write(path, export_lrc(&project.lyrics_lines))
-            .map_err(|error| format!("LRC-Export fehlgeschlagen: {error}"))?,
-        "srt" => fs::write(path, export_srt(&project.lyrics_lines))
-            .map_err(|error| format!("SRT-Export fehlgeschlagen: {error}"))?,
+        "txt" => write_bytes_atomically(path, export_text(project).as_bytes(), "TXT")?,
+        "lrc" => write_bytes_atomically(path, export_lrc(&project.lyrics_lines).as_bytes(), "LRC")?,
+        "srt" => write_bytes_atomically(path, export_srt(&project.lyrics_lines).as_bytes(), "SRT")?,
         "mid" | "midi" => {
             let bytes = export_midi_bytes(project)?;
-            fs::write(path, bytes)
-                .map_err(|error| format!("MIDI-Export fehlgeschlagen: {error}"))?;
+            write_bytes_atomically(path, &bytes, "MIDI")?;
         }
         "json" => {
             let bytes = serde_json::to_vec_pretty(project)
                 .map_err(|error| format!("JSON-Export fehlgeschlagen: {error}"))?;
-            fs::write(path, bytes)
-                .map_err(|error| format!("JSON-Export fehlgeschlagen: {error}"))?;
+            write_bytes_atomically(path, &bytes, "JSON")?;
         }
         "dbztab" => save_dbztab(project, path)?,
         _ => return Err(format!("Exportformat {format} wird nicht unterstützt.")),
@@ -111,6 +126,9 @@ pub fn export_project(
 pub fn save_dbztab(project: &SongProject, path: impl AsRef<Path>) -> Result<(), String> {
     project.validate()?;
     let path = path.as_ref();
+    if path.exists() && !path.is_file() {
+        return Err("Projektarchivziel ist keine reguläre Datei.".into());
+    }
     if path
         .extension()
         .and_then(|value| value.to_str())
@@ -118,7 +136,13 @@ pub fn save_dbztab(project: &SongProject, path: impl AsRef<Path>) -> Result<(), 
     {
         return Err("Das Projektarchiv benötigt die Endung .dbztab.".into());
     }
-    let output = File::create(path)
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Projektordner konnte nicht angelegt werden: {error}"))?;
+    }
+    let temporary_path = temporary_sibling_path(path);
+    let mut staging = TemporaryOutputFile { path: temporary_path, committed: false };
+    let output = OpenOptions::new().write(true).create_new(true).open(&staging.path)
         .map_err(|error| format!("Projektarchiv kann nicht erstellt werden: {error}"))?;
     let mut archive = ZipWriter::new(output);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
@@ -195,10 +219,110 @@ pub fn save_dbztab(project: &SongProject, path: impl AsRef<Path>) -> Result<(), 
         std::io::copy(&mut stem, &mut archive)
             .map_err(|error| format!("Stem-WAV konnte nicht eingebettet werden: {error}"))?;
     }
-    archive
+    let completed_file = archive
         .finish()
         .map_err(|error| format!("Projektarchiv konnte nicht abgeschlossen werden: {error}"))?;
+    completed_file
+        .sync_all()
+        .map_err(|error| format!("Projektarchiv konnte nicht dauerhaft geschrieben werden: {error}"))?;
+    replace_file_preserving_existing(&staging.path, path)?;
+    staging.committed = true;
     Ok(())
+}
+
+/// Zweck: Erzeugt einen kollisionsarmen temporären Dateipfad im selben Ordner wie das Ziel.
+/// Eingaben: Zieldateipfad und globaler Prozesszähler.
+/// Ausgabe: Geschwisterpfad für einen später sicher ersetzbaren Export.
+fn temporary_sibling_path(path: &Path) -> PathBuf {
+    let name = path.file_name().and_then(|value| value.to_str()).unwrap_or("livetab-project");
+    let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(".{name}.livetab-{}-{sequence}.tmp", std::process::id()))
+}
+
+/// Zweck: Schreibt Nutzbytes über den gemeinsamen atomaren Dateipfad.
+/// Eingaben: Zielpfad, vollständige Nutzbytes und nutzerlesbarer Exportformatname.
+/// Ausgabe: `Ok(())` nach sicherem Austausch oder ein Fehler, wobei ein vorhandenes Ziel geschützt bleibt.
+fn write_bytes_atomically(destination: &Path, bytes: &[u8], format: &str) -> Result<(), String> {
+    write_file_atomically(destination, format, |temporary| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(temporary)
+            .map_err(|error| format!("Temporäre {format}-Datei konnte nicht geöffnet werden: {error}"))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("{format}-Export konnte nicht vollständig geschrieben werden: {error}"))
+    })
+}
+
+/// Zweck: Veröffentlicht eine lokale Ausgabe erst nach vollständigem Schreiben und Synchronisieren.
+/// Eingaben: Zielpfad, Formatname und Writer, der ausschließlich die temporäre Schwesterdatei befüllt.
+/// Ausgabe: `Ok(())` nach sicherem Austausch oder ein verständlicher Datei-/Writerfehler.
+pub fn write_file_atomically<F>(destination: &Path, format: &str, writer: F) -> Result<(), String>
+where
+    F: FnOnce(&Path) -> Result<(), String>,
+{
+    if destination.exists() && !destination.is_file() {
+        return Err(format!("{format}-Ziel ist keine reguläre Datei."));
+    }
+    if let Some(parent) = destination.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("{format}-Zielordner konnte nicht angelegt werden: {error}"))?;
+    }
+    let mut staging = create_temporary_output_file(destination, format)?;
+    writer(&staging.path)?;
+    let completed = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&staging.path)
+        .map_err(|error| format!("Temporäre {format}-Datei fehlt nach dem Schreiben: {error}"))?;
+    completed
+        .sync_all()
+        .map_err(|error| format!("{format}-Datei konnte nicht dauerhaft geschrieben werden: {error}"))?;
+    drop(completed);
+    replace_file_preserving_existing(&staging.path, destination)?;
+    staging.committed = true;
+    Ok(())
+}
+
+/// Zweck: Reserviert kollisionsgeschützt eine temporäre Schwesterdatei mit begrenzten Wiederholungen.
+/// Eingaben: Zielpfad und nutzerlesbarer Formatname.
+/// Ausgabe: Guard für eine exklusive temporäre Datei oder ein Datei-/Kollisionsfehler.
+fn create_temporary_output_file(destination: &Path, format: &str) -> Result<TemporaryOutputFile, String> {
+    for _ in 0..32 {
+        let path = temporary_sibling_path(destination);
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => {
+                drop(file);
+                return Ok(TemporaryOutputFile { path, committed: false });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Temporäre {format}-Datei konnte nicht erstellt werden: {error}")),
+        }
+    }
+    Err(format!("Nach 32 Versuchen konnte keine temporäre {format}-Datei reserviert werden."))
+}
+
+/// Zweck: Ersetzt ein vorhandenes Ziel erst nach vollständigem Schreiben und stellt es bei Fehler wieder her.
+/// Eingaben: Vollständige temporäre Schwesterdatei und Zieldatei im selben Verzeichnis.
+/// Ausgabe: `Ok(())` nach Ersetzung oder Fehler mit Pfad zur eventuell nötigen Sicherung.
+fn replace_file_preserving_existing(temporary: &Path, destination: &Path) -> Result<(), String> {
+    if !destination.exists() {
+        return fs::rename(temporary, destination)
+            .map_err(|error| format!("Zieldatei konnte nicht veröffentlicht werden: {error}"));
+    }
+    let backup = temporary_sibling_path(destination).with_extension("backup");
+    fs::rename(destination, &backup)
+        .map_err(|error| format!("Vorhandene Zieldatei konnte nicht sicher vorgemerkt werden: {error}"))?;
+    match fs::rename(temporary, destination) {
+        Ok(()) => {
+            let _ = fs::remove_file(backup);
+            Ok(())
+        }
+        Err(error) => match fs::rename(&backup, destination) {
+            Ok(()) => Err(format!("Neue Zieldatei konnte nicht veröffentlicht werden; das bestehende Ziel wurde wiederhergestellt: {error}")),
+            Err(restore_error) => Err(format!("Neue Zieldatei konnte nicht veröffentlicht und das bisherige Ziel nicht zurückverschoben werden; Sicherung liegt unter {}: {error}; {restore_error}", backup.display())),
+        },
+    }
 }
 
 /// Zweck: Lädt ein `.dbztab`-Archiv, validiert das Manifest und extrahiert nur kanonische Audio-/Stem-Einträge.
@@ -225,6 +349,7 @@ pub fn load_dbztab(
         .map_err(|error| format!("Projektmanifest konnte nicht gelesen werden: {error}"))?;
     let mut project: SongProject = serde_json::from_slice(&bytes)
         .map_err(|error| format!("Projektmanifest ist ungültig: {error}"))?;
+    project.migrate_schema()?;
     project.validate()?;
     for track in &project.stem_tracks {
         let expected = format!("audio/stems/{}.wav", track.id);
@@ -316,28 +441,44 @@ pub fn load_dbztab(
 struct MidiEvent {
     tick: u64,
     kind: u8,
-    pitch: u8,
-    velocity: u8,
+    data: [u8; 7],
+    data_len: u8,
 }
 
-/// Zweck: Erzeugt einen SMF-Format-0-Standard-MIDI-Stream mit Tempo und Noten-On/Off-Ereignissen.
-/// Eingaben: Songprojekt mit BPM, Noten- und/oder Akkordereignissen.
-/// Ausgabe: MIDI-Dateibytes oder Fehler bei ungültigem Tempo/Dateilängen.
+/// Zweck: Erzeugt einen SMF-Format-0-Standard-MIDI-Stream mit Noten sowie Tempo-/Taktartwechseln.
+/// Eingaben: Validiertes Songprojekt mit gemeinsamer Timeline, Noten- und/oder Akkordereignissen.
+/// Ausgabe: MIDI-Dateibytes oder Fehler bei ungültiger Timeline, Ereignisgrenze oder Dateilänge.
 pub fn export_midi_bytes(project: &SongProject) -> Result<Vec<u8>, String> {
-    if !project.bpm.is_finite() || project.bpm <= 0.0 {
-        return Err("MIDI-Export benötigt ein positives Songtempo.".into());
-    }
+    project.validate()?;
+    let timeline = project.timeline_map()?;
+    const PPQ: u16 = 480;
     let mut events = Vec::new();
+    if !project.tempo_changes.iter().any(|change| change.time_seconds == 0.0) {
+        push_tempo_event(&mut events, 0, project.bpm)?;
+    }
+    for change in &project.tempo_changes {
+        let tick = timeline.seconds_to_ticks(change.time_seconds, project.bpm, PPQ)?;
+        push_tempo_event(&mut events, tick, change.bpm)?;
+    }
+    if !project.meter_changes.iter().any(|change| change.time_seconds == 0.0) {
+        push_meter_event(&mut events, 0, project.time_signature)?;
+    }
+    for change in &project.meter_changes {
+        let tick = timeline.seconds_to_ticks(change.time_seconds, project.bpm, PPQ)?;
+        push_meter_event(&mut events, tick, change.time_signature)?;
+    }
     if !project.notes.is_empty() {
         for note in &project.notes {
             midi_note_events(
                 &mut events,
+                &timeline,
                 project.bpm,
+                PPQ,
                 note.start_seconds(),
                 note.duration_seconds(),
                 note.midi(),
                 note.velocity(),
-            );
+            )?;
         }
     } else {
         for chord in &project.chords {
@@ -348,33 +489,24 @@ pub fn export_midi_bytes(project: &SongProject) -> Result<Vec<u8>, String> {
             for midi in notes {
                 midi_note_events(
                     &mut events,
+                    &timeline,
                     project.bpm,
+                    PPQ,
                     chord.start_seconds(),
                     chord.duration_seconds(),
                     midi,
                     80,
-                );
+                )?;
             }
         }
     }
     events.sort_by_key(|event| (event.tick, event.kind));
-    let micros = (60_000_000.0 / project.bpm)
-        .round()
-        .clamp(1.0, 0xFF_FFFF as f64) as u32;
-    let mut track = vec![
-        0x00,
-        0xFF,
-        0x51,
-        0x03,
-        (micros >> 16) as u8,
-        (micros >> 8) as u8,
-        micros as u8,
-    ];
+    let mut track = Vec::new();
     let mut previous_tick = 0u64;
     for event in events {
         let delta = event.tick.saturating_sub(previous_tick);
         write_variable_length(delta, &mut track);
-        track.extend_from_slice(&[event.kind, event.pitch, event.velocity]);
+        track.extend_from_slice(&event.data[..usize::from(event.data_len)]);
         previous_tick = event.tick;
     }
     track.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
@@ -384,39 +516,84 @@ pub fn export_midi_bytes(project: &SongProject) -> Result<Vec<u8>, String> {
     output.extend_from_slice(&6u32.to_be_bytes());
     output.extend_from_slice(&0u16.to_be_bytes());
     output.extend_from_slice(&1u16.to_be_bytes());
-    output.extend_from_slice(&480u16.to_be_bytes());
+    output.extend_from_slice(&PPQ.to_be_bytes());
     output.extend_from_slice(b"MTrk");
     output.extend_from_slice(&track_len.to_be_bytes());
     output.extend_from_slice(&track);
     Ok(output)
 }
 
-/// Zweck: Fügt Note-On- und Note-Off-Ereignisse an die MIDI-Ereignisliste an.
-/// Eingaben: Tempo, Start/Dauer in Sekunden, MIDI-Ton und Velocity.
-/// Ausgabe: Keine Rückgabe; Ereignisse verwenden 480 Ticks je Viertelnote.
+/// Zweck: Fügt Note-On- und Note-Off-Ereignisse mithilfe der kanonischen Timeline ein.
+/// Eingaben: Eventliste, TimelineMap, Basis-BPM, PPQ, Zeitfenster, MIDI-Ton und Velocity.
+/// Ausgabe: `Ok(())` oder kontrollierter Fehler bei ungültiger Zeit/Tickgrenze.
 fn midi_note_events(
     events: &mut Vec<MidiEvent>,
+    timeline: &TimelineMap,
     bpm: f64,
+    ppq: u16,
     start: f64,
     duration: f64,
     pitch: u8,
     velocity: u8,
-) {
-    let to_tick = |seconds: f64| (seconds.max(0.0) * bpm / 60.0 * 480.0).round() as u64;
-    let start_tick = to_tick(start);
-    let end_tick = to_tick(start + duration).max(start_tick + 1);
-    events.push(MidiEvent {
-        tick: start_tick,
-        kind: 0x90,
-        pitch,
-        velocity,
-    });
-    events.push(MidiEvent {
-        tick: end_tick,
-        kind: 0x80,
-        pitch,
-        velocity: 0,
-    });
+) -> Result<(), String> {
+    let end = start + duration;
+    if !start.is_finite() || !duration.is_finite() || !end.is_finite() || start < 0.0 || duration <= 0.0 {
+        return Err("MIDI-Notenzeit muss endlich, nichtnegativ und positiv lang sein.".into());
+    }
+    let start_tick = timeline.seconds_to_ticks(start, bpm, ppq)?;
+    let end_tick = timeline.seconds_to_ticks(end, bpm, ppq)?
+        .max(start_tick.saturating_add(1));
+    push_midi_message(events, start_tick, 0x90, &[0x90, pitch, velocity])?;
+    push_midi_message(events, end_tick, 0x80, &[0x80, pitch, 0])
+}
+
+/// Zweck: Fügt ein SMF-Tempo-Metereignis mit Mikrosekunden je Viertelnote ein.
+/// Eingaben: Eventliste, absolute Tickposition und positives Viertelnoten-BPM.
+/// Ausgabe: `Ok(())` oder kontrollierter Fehler bei Wert-/Eventgrenzen.
+fn push_tempo_event(events: &mut Vec<MidiEvent>, tick: u64, bpm: f64) -> Result<(), String> {
+    if !bpm.is_finite() || bpm <= 0.0 {
+        return Err("MIDI-Tempo muss positiv und endlich sein.".into());
+    }
+    let micros = (60_000_000.0 / bpm).round().clamp(1.0, 0xFF_FFFF as f64) as u32;
+    push_midi_message(events, tick, 0, &[
+        0xFF, 0x51, 0x03, (micros >> 16) as u8, (micros >> 8) as u8, micros as u8,
+    ])
+}
+
+/// Zweck: Fügt ein SMF-Taktart-Metereignis für Zähler und Zweierpotenz-Nenner ein.
+/// Eingaben: Eventliste, absolute Tickposition und validierte Taktart.
+/// Ausgabe: `Ok(())` oder Begrenzungsfehler.
+fn push_meter_event(
+    events: &mut Vec<MidiEvent>,
+    tick: u64,
+    meter: crate::domain::TimeSignature,
+) -> Result<(), String> {
+    push_midi_message(events, tick, 0, &[
+        0xFF, 0x58, 0x04, meter.numerator(), meter.denominator().trailing_zeros() as u8, 24, 8,
+    ])
+}
+
+/// Zweck: Speichert eine begrenzte SMF-Nachricht in der sortierbaren MIDI-Ereignisliste.
+/// Eingaben: Eventliste, Tick, Sortierpriorität und höchstens sieben Nachrichtenbytes.
+/// Ausgabe: `Ok(())` oder kontrollierter Fehler bei ungültiger Nachricht, Tick oder Kapazität.
+fn push_midi_message(
+    events: &mut Vec<MidiEvent>,
+    tick: u64,
+    kind: u8,
+    message: &[u8],
+) -> Result<(), String> {
+    if tick > MAX_TIMELINE_TICKS || message.is_empty() || message.len() > 7 {
+        return Err("MIDI-Nachricht überschreitet Tick- oder Längenlimit.".into());
+    }
+    if events.len() >= MAX_MIDI_EVENTS {
+        return Err(format!("MIDI-Export überschreitet {MAX_MIDI_EVENTS} Ereignisse."));
+    }
+    events.try_reserve(1)
+        .map_err(|_| "MIDI-Eventliste kann nicht sicher reserviert werden.".to_string())?;
+    let mut data = [0_u8; 7];
+    data[..message.len()].copy_from_slice(message);
+    events.push(MidiEvent { tick, kind, data, data_len: message.len() as u8 });
+    Ok(())
 }
 
 /// Zweck: Kodiert ein MIDI-Delta als Standard-Variable-Length-Quantity.
@@ -441,6 +618,7 @@ mod tests {
     use super::*;
     use crate::domain::TimeSignature;
     use crate::song::NoteEvent;
+    use crate::timeline::{MeterChange, TempoChange};
 
     /// Zweck: Prüft Text- und MIDI-Export samt SMF-Kopf und Tempo-/Notenereignissen.
     /// Eingaben: Keine; erstellt ein Projekt mit einer zeitlich begrenzten MIDI-Note.
@@ -459,6 +637,62 @@ mod tests {
         assert!(midi.windows(4).any(|window| window == b"MTrk"));
         assert!(midi.windows(3).any(|window| window == [0x07, 0xA1, 0x20]));
         assert_eq!(project.time_signature, TimeSignature::default());
+    }
+
+    /// Zweck: Prüft, dass Tempo-/Taktwechsel als echte SMF-Metaevents auf der integrierten Timeline erscheinen.
+    /// Eingaben: Projekt mit 120→60 BPM und einem Wechsel von 4/4 auf 3/4 nach zwei Sekunden.
+    /// Ausgabe: Keine Rückgabe; Assertions sichern die beiden Tempo- und Taktart-Metadaten.
+    #[test]
+    fn midi_export_preserves_tempo_and_meter_changes() {
+        let mut project = SongProject::new("Map", "DBZS");
+        project.duration_seconds = 4.0;
+        project.notes.push(NoteEvent::new(69, 3.0, 1.0).unwrap());
+        project.set_tempo_changes(vec![TempoChange { time_seconds: 2.0, bpm: 60.0 }]).unwrap();
+        project.set_meter_changes(vec![MeterChange {
+            time_seconds: 2.0,
+            time_signature: TimeSignature::new(3, 4).unwrap(),
+        }]).unwrap();
+        let midi = export_midi_bytes(&project).unwrap();
+        assert!(midi.windows(6).any(|bytes| bytes == [0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20]));
+        assert!(midi.windows(6).any(|bytes| bytes == [0xFF, 0x51, 0x03, 0x0F, 0x42, 0x40]));
+        assert!(midi.windows(7).any(|bytes| bytes == [0xFF, 0x58, 0x04, 0x04, 0x02, 24, 8]));
+        assert!(midi.windows(7).any(|bytes| bytes == [0xFF, 0x58, 0x04, 0x03, 0x02, 24, 8]));
+    }
+
+    /// Zweck: Prüft atomaren MIDI-Export auf ein vorhandenes Ziel und schützt Verzeichnisse vor Ersetzung.
+    /// Eingaben: Temporäres Ziel mit Altinhalt sowie ein minimales, gültiges Songprojekt.
+    /// Ausgabe: Keine Rückgabe; Assertions sichern vollständige Veröffentlichung und Zielschutz.
+    #[test]
+    fn exports_replace_files_atomically_and_reject_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("atomic.mid");
+        std::fs::write(&destination, b"old data").unwrap();
+        let mut project = SongProject::new("Atomic", "DBZS");
+        project.duration_seconds = 1.0;
+        project.notes.push(NoteEvent::new(60, 0.0, 0.5).unwrap());
+        export_project(&project, &destination, "mid").unwrap();
+        assert!(std::fs::read(&destination).unwrap().starts_with(b"MThd"));
+        let directory_target = dir.path().join("keep-directory");
+        std::fs::create_dir(&directory_target).unwrap();
+        assert!(export_project(&project, &directory_target, "txt").is_err());
+        assert!(directory_target.is_dir());
+    }
+
+    /// Zweck: Prüft, dass ein fehlschlagender Dateiwriter nur sein Staging entfernt und das alte Ziel erhält.
+    /// Eingaben: Vorhandene Zieldatei und Writer, der partielle Temporärbytes schreibt und danach einen Fehler liefert.
+    /// Ausgabe: Keine Rückgabe; Assertion sichert unveränderten Altinhalt.
+    #[test]
+    fn failed_atomic_writer_preserves_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("existing.audio");
+        std::fs::write(&destination, b"previous complete data").unwrap();
+        let result = write_file_atomically(&destination, "TEST", |temporary| {
+            std::fs::write(temporary, b"partial replacement")
+                .map_err(|error| error.to_string())?;
+            Err("synthetic writer failure".into())
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), b"previous complete data");
     }
 
     /// Zweck: Prüft das portable ZIP-Projektformat und den JSON-/Audio-Pfad-Roundtrip.
