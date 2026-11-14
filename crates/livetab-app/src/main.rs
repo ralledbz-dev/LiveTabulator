@@ -5,6 +5,7 @@ mod audio_capture;
 mod audio_encoding;
 mod llama_runtime;
 mod playback_output;
+mod panel_layout;
 mod stem_workflow;
 
 use crate::llama_runtime::LoadedModel;
@@ -46,6 +47,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         .into(),
     );
+    // Zweck: Übernimmt Splittermaße nur innerhalb der zentral getesteten Grenzen.
+    // Eingaben: `panel_id` und angeforderte logische Pixelgröße aus dem Slint-Ziehgriff.
+    // Ausgabe: Kein Rückgabewert; die passende Größen-Eigenschaft wird aktualisiert oder ignoriert.
+    {
+        let weak = ui.as_weak();
+        ui.on_panel_extent_requested(move |panel_id, requested_pixels| {
+            let Some(handle) = weak.upgrade() else { return };
+            let Some(extent) =
+                panel_layout::clamp_panel_extent(panel_id.as_str(), requested_pixels)
+            else {
+                return;
+            };
+            match panel_id.as_str() {
+                "left" => handle.set_left_panel_width(extent),
+                "right" => handle.set_right_panel_width(extent),
+                "bottom" => handle.set_bottom_panel_height(extent),
+                _ => {}
+            }
+        });
+    }
+    // Zweck: Schaltet linke, rechte oder untere Hauptfläche um, ohne Restore-Schalter zu verbergen.
+    // Eingaben: `panel_id` sowie der bisherige Sichtbarkeitszustand aus dem Slint-Callback.
+    // Ausgabe: Kein Rückgabewert; Rust setzt die passende Sichtbarkeitseigenschaft oder verwirft Unbekanntes.
+    {
+        let weak = ui.as_weak();
+        ui.on_panel_visibility_requested(move |panel_id, currently_visible| {
+            let Some(handle) = weak.upgrade() else { return };
+            let Some(next_visible) =
+                panel_layout::toggle_panel_visibility(panel_id.as_str(), currently_visible)
+            else {
+                return;
+            };
+            match panel_id.as_str() {
+                "left" => handle.set_show_left_panel(next_visible),
+                "right" => handle.set_show_right_panel(next_visible),
+                "bottom" => handle.set_show_bottom_panel(next_visible),
+                _ => {}
+            }
+        });
+    }
     let app_models_dir = app_models_directory();
     let current_model: ModelPathState = Arc::new(Mutex::new(None));
     let runtime_state: RuntimeState = Arc::new(Mutex::new(None));
